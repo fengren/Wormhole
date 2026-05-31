@@ -207,6 +207,38 @@ button:disabled {
   background: #eef3f1;
 }
 
+.update-button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid #d7dfdc;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #33423f;
+  font-size: 13px;
+  font-weight: 720;
+  padding: 8px 12px;
+  box-shadow: 0 1px 2px rgb(16 24 23 / 4%);
+}
+
+.update-button:hover:not(:disabled) {
+  border-color: #9cbab2;
+  background: #f4faf8;
+  color: #0f6e5c;
+}
+
+.update-button:disabled .icon {
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .connection-list {
   display: flex;
   min-height: 0;

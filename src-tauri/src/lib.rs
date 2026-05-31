@@ -1086,6 +1086,7 @@ fn quit_from_quick_panel(app: AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(RuntimeState {
             children: Mutex::new(HashMap::new()),
             traffic: Mutex::new(None),

@@ -17,6 +17,7 @@ Wormhole 是一个 macOS SSH 隧道管理工具，基于 Tauri 2 和原生 TypeS
 - 关闭主窗口后保持隧道继续运行。
 - 退出应用时自动断开运行中的隧道。
 - 主界面支持中英文切换。
+- 支持从 GitHub Releases 检查、下载并安装签名更新包。
 - 支持通过 GitHub tag 触发 GitHub Actions 构建 macOS 发布包。
 
 ## 隧道类型
@@ -128,7 +129,29 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-该工作流会在 macOS 环境中安装 Node.js 和 Rust，执行 `npm test`，构建 Tauri 应用，并创建一个包含 macOS 构建产物的 GitHub draft release。
+该工作流会在 macOS 环境中安装 Node.js 和 Rust，执行 `npm test`，构建 Tauri 应用，并创建一个包含 macOS 构建产物的正式 GitHub Release。
+
+工作流不会再创建 draft release，这样应用内更新器才能发现最新的 `latest.json` 更新清单。
+
+## 应用更新
+
+Wormhole 使用 Tauri updater 插件。应用会检查以下更新地址：
+
+```text
+https://github.com/fengren/Wormhole/releases/latest/download/latest.json
+```
+
+更新包必须签名。updater 公钥存储在 `src-tauri/tauri.conf.json` 中；匹配的私钥需要配置为 GitHub Actions secret：
+
+```sh
+gh secret set TAURI_SIGNING_PRIVATE_KEY < /path/to/private-updater-key
+```
+
+如果私钥设置了密码，还需要配置：
+
+```sh
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+```
 
 当前仓库默认没有配置代码签名和 notarization。如果要发布生产版本，请先补充 Apple Developer 相关签名配置。
 

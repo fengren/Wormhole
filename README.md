@@ -17,6 +17,7 @@ Wormhole is a macOS SSH tunnel manager built with Tauri 2 and vanilla TypeScript
 - Keep tunnels running when the main window is closed.
 - Stop tunnels automatically when the app quits.
 - Switch the main UI between English and Chinese.
+- Check, download, and install signed app updates from GitHub Releases.
 - Build macOS release bundles from GitHub tags with GitHub Actions.
 
 ## Tunnel Types
@@ -128,7 +129,29 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The workflow runs on macOS, installs Node.js and Rust, runs `npm test`, builds the Tauri app, and creates a draft GitHub release with the generated macOS bundles.
+The workflow runs on macOS, installs Node.js and Rust, runs `npm test`, builds the Tauri app, and creates a GitHub release with the generated macOS bundles.
+
+The workflow publishes a normal GitHub Release instead of a draft release so the in-app updater can discover the latest `latest.json` manifest.
+
+## App Updates
+
+Wormhole uses the Tauri updater plugin. The app checks this update endpoint:
+
+```text
+https://github.com/fengren/Wormhole/releases/latest/download/latest.json
+```
+
+Updater packages must be signed. The public updater key is stored in `src-tauri/tauri.conf.json`; the matching private key must be configured as a GitHub Actions secret:
+
+```sh
+gh secret set TAURI_SIGNING_PRIVATE_KEY < /path/to/private-updater-key
+```
+
+If the private key has a password, also set:
+
+```sh
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+```
 
 Code signing and notarization are not configured in this repository by default. Add your Apple Developer signing configuration before publishing production builds.
 

@@ -1,12 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { check } from "@tauri-apps/plugin-updater";
 import {
   Activity,
+  Download,
   Languages,
   LayoutDashboard,
   Network,
   Plus,
   Power,
+  RefreshCw,
   Route,
   Router,
   Save,
@@ -96,15 +99,18 @@ let serviceStatus: ServiceStatus = {
 let message = "";
 let messageKind: "info" | "error" = "info";
 let monitorSamples: MonitorSample[] = [];
+let updateBusy = false;
 
 const app = document.querySelector<HTMLDivElement>("#app");
 const lucideIcons = {
   Activity,
+  Download,
   Languages,
   LayoutDashboard,
   Network,
   Plus,
   Power,
+  RefreshCw,
   Route,
   Router,
   Save,
@@ -178,7 +184,14 @@ type I18nKey =
   | "message.serviceStopped"
   | "message.withIssues"
   | "message.serviceStartedDetail"
-  | "message.serviceStoppedDetail";
+  | "message.serviceStoppedDetail"
+  | "update.check"
+  | "update.checking"
+  | "update.available"
+  | "update.notAvailable"
+  | "update.downloading"
+  | "update.installed"
+  | "update.failed";
 
 const translations: Record<Language, Record<I18nKey, string>> = {
   en: {
@@ -240,6 +253,13 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "message.withIssues": "{action} with {count} issue(s): {issues}",
     "message.serviceStartedDetail": "Service started. {running}/{total} tunnel(s) running, {clients} client(s) connected.",
     "message.serviceStoppedDetail": "Service stopped. {total} tunnel(s) stopped, {clients} client(s) connected.",
+    "update.check": "Check updates",
+    "update.checking": "Checking for updates...",
+    "update.available": "Version {version} is available. Downloading...",
+    "update.notAvailable": "Wormhole is up to date.",
+    "update.downloading": "Downloading update: {progress}%",
+    "update.installed": "Update installed. Restart Wormhole to apply it.",
+    "update.failed": "Update failed: {error}",
   },
   zh: {
     "app.subtitle": "SSH 隧道",
@@ -300,6 +320,13 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "message.withIssues": "{action}完成，但有 {count} 个问题：{issues}",
     "message.serviceStartedDetail": "服务已启动。{running}/{total} 个隧道运行中，{clients} 个客户端已连接。",
     "message.serviceStoppedDetail": "服务已停止。{total} 个隧道已停止，{clients} 个客户端已连接。",
+    "update.check": "检查更新",
+    "update.checking": "正在检查更新...",
+    "update.available": "发现版本 {version}，正在下载...",
+    "update.notAvailable": "Wormhole 已是最新版本。",
+    "update.downloading": "正在下载更新：{progress}%",
+    "update.installed": "更新已安装，重启 Wormhole 后生效。",
+    "update.failed": "更新失败：{error}",
   },
 };
 
@@ -613,6 +640,46 @@ async function quitFromQuickPanel() {
   await invoke("quit_from_quick_panel");
 }
 
+async function checkForUpdates() {
+  if (updateBusy) return;
+  updateBusy = true;
+  render();
+  showMessage(t("update.checking"));
+
+  try {
+    const update = await check();
+    if (!update) {
+      showMessage(t("update.notAvailable"));
+      return;
+    }
+
+    showMessage(t("update.available", { version: update.version }));
+    let downloaded = 0;
+    let total = 0;
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        total = event.data.contentLength ?? 0;
+        downloaded = 0;
+      } else if (event.event === "Progress") {
+        downloaded += event.data.chunkLength;
+        if (total > 0) {
+          showMessage(
+            t("update.downloading", {
+              progress: Math.min(100, Math.round((downloaded / total) * 100)),
+            }),
+          );
+        }
+      }
+    });
+    showMessage(t("update.installed"));
+  } catch (error) {
+    showMessage(t("update.failed", { error: String(error) }), "error");
+  } finally {
+    updateBusy = false;
+    render();
+  }
+}
+
 function renderList() {
   if (connections.length === 0) {
     return `<div class="empty">${escapeHtml(t("noTunnels"))}</div>`;
@@ -830,6 +897,14 @@ function renderLanguageToggle() {
   `;
 }
 
+function renderUpdateButton() {
+  return `
+    <button type="button" class="update-button" data-action="check-update" ${updateBusy ? "disabled" : ""}>
+      ${icon(updateBusy ? "refresh-cw" : "download")} ${escapeHtml(updateBusy ? t("update.checking") : t("update.check"))}
+    </button>
+  `;
+}
+
 function renderQuickPanel() {
   const runningCount = connections.filter((connection) => connection.status === "running").length;
   const activeId = selectedId ?? connections[0]?.id ?? null;
@@ -1008,6 +1083,7 @@ function render() {
           </button>
         </div>
         ${renderLanguageToggle()}
+        ${renderUpdateButton()}
         <button type="button" class="new-button" data-action="new">${icon("plus")} ${escapeHtml(t("newTunnel"))}</button>
         <div class="connection-list">${renderList()}</div>
       </aside>
@@ -1035,6 +1111,7 @@ async function handleAction(action: string, id: string | null, lang: string | nu
   if (action === "choose-key") await choosePrivateKey();
   if (action === "open-selected-config") await openSelectedQuickConfig();
   if (action === "quit-app") await quitFromQuickPanel();
+  if (action === "check-update" && !isQuickPanel) await checkForUpdates();
   if (action === "language" && (lang === "en" || lang === "zh")) setLanguage(lang);
 }
 
