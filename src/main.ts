@@ -25,8 +25,7 @@ import {
 type TunnelType = "local" | "remote" | "dynamic";
 type AuthMethod = "password" | "key";
 type AuthProfile = "normal" | "mfa";
-type StartMode = "manual" | "on_demand" | "always";
-type TunnelStatus = "stopped" | "running" | "exited" | "dormant" | "needs_auth";
+type TunnelStatus = "stopped" | "running" | "exited" | "needs_auth";
 type ViewMode = "overview" | "new" | "edit" | "settings";
 type UpdateState = "idle" | "checking" | "downloading" | "installed";
 
@@ -43,9 +42,7 @@ type Connection = {
   remote_host?: string;
   remote_port?: number;
   auth_profile: AuthProfile;
-  start_mode: StartMode;
   auto_reconnect: boolean;
-  idle_timeout_seconds: number;
   status: TunnelStatus;
 };
 
@@ -89,9 +86,7 @@ const emptyDraft: ConnectionInput = {
   remote_host: "127.0.0.1",
   remote_port: 80,
   auth_profile: "normal",
-  start_mode: "manual",
   auto_reconnect: true,
-  idle_timeout_seconds: 600,
   password: "",
   key_passphrase: "",
 };
@@ -159,7 +154,6 @@ type I18nKey =
   | "status.running"
   | "status.stopped"
   | "status.exited"
-  | "status.dormant"
   | "status.needsAuth"
   | "status.needsAttention"
   | "form.editTitle"
@@ -180,13 +174,8 @@ type I18nKey =
   | "form.authProfile"
   | "form.authNormal"
   | "form.authMfa"
-  | "form.startMode"
-  | "form.startManual"
-  | "form.startOnDemand"
-  | "form.startAlways"
   | "form.autoReconnect"
-  | "form.idleTimeout"
-  | "form.idleTimeoutHint"
+  | "form.autoReconnectHint"
   | "form.remoteListenPort"
   | "form.localListenPort"
   | "form.targetHost"
@@ -250,7 +239,6 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "status.running": "Running",
     "status.stopped": "Stopped",
     "status.exited": "Exited",
-    "status.dormant": "On demand",
     "status.needsAuth": "Needs auth",
     "status.needsAttention": "Needs attention",
     "form.editTitle": "Edit tunnel",
@@ -271,13 +259,8 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "form.authProfile": "Authentication profile",
     "form.authNormal": "Normal",
     "form.authMfa": "MFA",
-    "form.startMode": "Start mode",
-    "form.startManual": "Manual",
-    "form.startOnDemand": "On demand",
-    "form.startAlways": "Always on",
     "form.autoReconnect": "Auto reconnect",
-    "form.idleTimeout": "Idle timeout",
-    "form.idleTimeoutHint": "MFA tunnels stay connected until stopped manually.",
+    "form.autoReconnectHint": "Only normal authentication can reconnect automatically. MFA tunnels require manual re-authentication.",
     "form.remoteListenPort": "Remote listen port",
     "form.localListenPort": "Local listen port",
     "form.targetHost": "Target host",
@@ -340,7 +323,6 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "status.running": "运行中",
     "status.stopped": "已停止",
     "status.exited": "已退出",
-    "status.dormant": "按需待机",
     "status.needsAuth": "需要认证",
     "status.needsAttention": "需要处理",
     "form.editTitle": "编辑隧道",
@@ -361,13 +343,8 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "form.authProfile": "认证模式",
     "form.authNormal": "普通",
     "form.authMfa": "MFA",
-    "form.startMode": "启动模式",
-    "form.startManual": "手动",
-    "form.startOnDemand": "按需",
-    "form.startAlways": "长期",
     "form.autoReconnect": "自动重连",
-    "form.idleTimeout": "空闲断联",
-    "form.idleTimeoutHint": "MFA 隧道会保持长连接，直到手动停止。",
+    "form.autoReconnectHint": "仅普通认证支持自动重连。MFA 隧道断开后需要手动重新认证。",
     "form.remoteListenPort": "远端监听端口",
     "form.localListenPort": "本地监听端口",
     "form.targetHost": "目标主机",
@@ -460,7 +437,6 @@ function connectionSummary(connection: Connection): string {
 
 function statusText(status: TunnelStatus): string {
   if (status === "running") return t("status.running");
-  if (status === "dormant") return t("status.dormant");
   if (status === "needs_auth") return t("status.needsAuth");
   if (status === "exited") return t("status.exited");
   return t("status.stopped");
@@ -560,6 +536,7 @@ function readInput(form: HTMLFormElement): ConnectionInput {
     return Number.isFinite(parsed) ? parsed : fallback;
   };
   const tunnelType = value("tunnel_type") as TunnelType;
+  const authProfile = value("auth_profile") as AuthProfile;
 
   return {
     id: selectedId ?? undefined,
@@ -576,10 +553,8 @@ function readInput(form: HTMLFormElement): ConnectionInput {
     remote_host: tunnelType === "dynamic" ? undefined : value("remote_host"),
     remote_port:
       tunnelType === "dynamic" ? undefined : numeric("remote_port", 80),
-    auth_profile: value("auth_profile") as AuthProfile,
-    start_mode: value("start_mode") as StartMode,
-    auto_reconnect: data.get("auto_reconnect") === "on",
-    idle_timeout_seconds: numeric("idle_timeout_seconds", 600),
+    auth_profile: authProfile,
+    auto_reconnect: authProfile === "normal" && data.get("auto_reconnect") === "on",
   };
 }
 
@@ -701,7 +676,7 @@ async function stopTunnel(id: string) {
 async function toggleTunnel(id: string) {
   const connection = connections.find((item) => item.id === id);
   if (!connection || busyId) return;
-  if (connection.status === "running" || connection.status === "dormant") {
+  if (connection.status === "running") {
     await stopTunnel(id);
     return;
   }
@@ -944,7 +919,7 @@ function renderMonitorChart(options: {
 }
 
 function renderTunnelSwitch(connection: Connection) {
-  const isRunning = connection.status === "running" || connection.status === "dormant";
+  const isRunning = connection.status === "running";
   const busy = busyId === connection.id;
   const label = `${isRunning ? t("message.serviceStopped") : t("message.serviceStarted")} ${connection.name}, ${statusText(connection.status)}`;
 
@@ -1144,7 +1119,9 @@ function renderQuickRows() {
 function renderForm() {
   const authMethod = field("auth_method");
   const tunnelType = field("tunnel_type");
+  const authProfile = field("auth_profile");
   const isDynamic = tunnelType === "dynamic";
+  const canAutoReconnect = authProfile === "normal";
   const selected = selectedId
     ? connections.find((connection) => connection.id === selectedId)
     : null;
@@ -1229,28 +1206,16 @@ function renderForm() {
           <label>
             ${escapeHtml(t("form.authProfile"))}
             <select name="auth_profile">
-              <option value="normal" ${field("auth_profile") === "normal" ? "selected" : ""}>${escapeHtml(t("form.authNormal"))}</option>
-              <option value="mfa" ${field("auth_profile") === "mfa" ? "selected" : ""}>${escapeHtml(t("form.authMfa"))}</option>
+              <option value="normal" ${authProfile === "normal" ? "selected" : ""}>${escapeHtml(t("form.authNormal"))}</option>
+              <option value="mfa" ${authProfile === "mfa" ? "selected" : ""}>${escapeHtml(t("form.authMfa"))}</option>
             </select>
-          </label>
-          <label>
-            ${escapeHtml(t("form.startMode"))}
-            <select name="start_mode">
-              <option value="manual" ${field("start_mode") === "manual" ? "selected" : ""}>${escapeHtml(t("form.startManual"))}</option>
-              <option value="on_demand" ${field("start_mode") === "on_demand" ? "selected" : ""}>${escapeHtml(t("form.startOnDemand"))}</option>
-              <option value="always" ${field("start_mode") === "always" ? "selected" : ""}>${escapeHtml(t("form.startAlways"))}</option>
-            </select>
-          </label>
-          <label>
-            ${escapeHtml(t("form.idleTimeout"))}
-            <input name="idle_timeout_seconds" type="number" min="30" max="86400" value="${escapeHtml(field("idle_timeout_seconds"))}" />
           </label>
         </div>
         <label class="checkbox-row">
-          <input name="auto_reconnect" type="checkbox" ${field("auto_reconnect") ? "checked" : ""} />
+          <input name="auto_reconnect" type="checkbox" ${field("auto_reconnect") && canAutoReconnect ? "checked" : ""} ${canAutoReconnect ? "" : "disabled"} />
           <span>${escapeHtml(t("form.autoReconnect"))}</span>
         </label>
-        <p>${escapeHtml(t("form.idleTimeoutHint"))}</p>
+        <p>${escapeHtml(t("form.autoReconnectHint"))}</p>
       </details>
 
       <div class="actions">
@@ -1366,7 +1331,14 @@ function bindAppEvents() {
 
   app.addEventListener("change", (event) => {
     const target = event.target;
-    if (!(target instanceof HTMLInputElement) || target.type !== "radio") return;
+    if (
+      !(
+        (target instanceof HTMLInputElement && target.type === "radio") ||
+        target instanceof HTMLSelectElement
+      )
+    ) {
+      return;
+    }
     const form = target.form;
     if (!form) return;
     draft = readInput(form);

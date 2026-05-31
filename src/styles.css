@@ -332,12 +332,6 @@ button:disabled {
   color: #9a4a14;
 }
 
-.connection-icon.dormant {
-  border-color: #a9c9dd;
-  background: #edf7fd;
-  color: #1f6f94;
-}
-
 .connection-icon.needs_auth {
   border-color: #e7b6b1;
   background: #fff0ef;
@@ -420,11 +414,6 @@ button:disabled {
   background: #f3c19c;
 }
 
-.tunnel-toggle.dormant .toggle-track {
-  border-color: #74a9c8;
-  background: #9dd4ef;
-}
-
 .tunnel-toggle.needs_auth .toggle-track {
   border-color: #e7b6b1;
   background: #f3b6b0;
@@ -456,11 +445,6 @@ button:disabled {
 .status.exited {
   background: #fff2e9;
   color: #9a4a14;
-}
-
-.status.dormant {
-  background: #edf7fd;
-  color: #1f6f94;
 }
 
 .status.needs_auth {
