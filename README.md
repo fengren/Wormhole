@@ -141,7 +141,7 @@ Wormhole uses the Tauri updater plugin. The app checks this update endpoint:
 https://github.com/fengren/Wormhole/releases/latest/download/latest.json
 ```
 
-Updater packages must be signed. The public updater key is stored in `src-tauri/tauri.conf.json`; the matching private key must be configured as a GitHub Actions secret:
+Updater packages must be signed, and `bundle.createUpdaterArtifacts` must be enabled in `src-tauri/tauri.conf.json` so Tauri generates the updater archive signature and `latest.json` manifest. The public updater key is stored in `src-tauri/tauri.conf.json`; the matching private key must be configured as a GitHub Actions secret:
 
 ```sh
 gh secret set TAURI_SIGNING_PRIVATE_KEY < /path/to/private-updater-key

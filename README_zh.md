@@ -141,7 +141,7 @@ Wormhole 使用 Tauri updater 插件。应用会检查以下更新地址：
 https://github.com/fengren/Wormhole/releases/latest/download/latest.json
 ```
 
-更新包必须签名。updater 公钥存储在 `src-tauri/tauri.conf.json` 中；匹配的私钥需要配置为 GitHub Actions secret：
+更新包必须签名，并且需要在 `src-tauri/tauri.conf.json` 中启用 `bundle.createUpdaterArtifacts`，这样 Tauri 才会生成更新归档签名和 `latest.json` 清单。updater 公钥存储在 `src-tauri/tauri.conf.json` 中；匹配的私钥需要配置为 GitHub Actions secret：
 
 ```sh
 gh secret set TAURI_SIGNING_PRIVATE_KEY < /path/to/private-updater-key
