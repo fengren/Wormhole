@@ -170,6 +170,28 @@ button:disabled {
   background: #f3fbf8;
 }
 
+.settings-button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid #d7dfdc;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #33423f;
+  font-weight: 700;
+  padding: 8px 12px;
+  box-shadow: 0 1px 2px rgb(16 24 23 / 4%);
+}
+
+.settings-button:hover,
+.settings-button.active {
+  border-color: #7fb2a6;
+  background: #f3fbf8;
+  color: #0f6e5c;
+}
+
 .language-toggle {
   display: grid;
   grid-template-columns: 28px 1fr 1fr;
@@ -440,7 +462,8 @@ button:disabled {
 }
 
 .overview,
-.editor {
+.editor,
+.settings-panel {
   display: flex;
   max-width: 1040px;
   flex-direction: column;
@@ -454,6 +477,13 @@ button:disabled {
   gap: 12px;
 }
 
+.settings-heading {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
 .overview-logo {
   width: 44px;
   height: 44px;
@@ -461,7 +491,8 @@ button:disabled {
 }
 
 .overview-heading h2,
-.editor-heading h2 {
+.editor-heading h2,
+.settings-heading h2 {
   display: flex;
   align-items: center;
   gap: 9px;
@@ -479,9 +510,63 @@ button:disabled {
 }
 
 .overview-heading p,
-.editor-heading p {
+.editor-heading p,
+.settings-heading p {
   margin: 4px 0 0;
   color: #71817d;
+}
+
+.settings-list {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-row {
+  display: grid;
+  min-height: 92px;
+  grid-template-columns: minmax(0, 1fr) minmax(190px, auto);
+  align-items: center;
+  gap: 18px;
+  border: 1px solid #dde4e1;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 16px;
+  box-shadow: 0 1px 2px rgb(16 24 23 / 3%);
+}
+
+.settings-row h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: #111918;
+  font-size: 15px;
+  font-weight: 740;
+}
+
+.settings-row h3 .icon {
+  color: #16705f;
+}
+
+.settings-row p {
+  margin: 5px 0 0;
+  color: #71817d;
+  font-size: 13px;
+}
+
+.settings-row .language-toggle {
+  min-width: 210px;
+}
+
+.version-value {
+  justify-self: end;
+  border: 1px solid #d7dfdc;
+  border-radius: 999px;
+  background: #f7faf9;
+  color: #33423f;
+  font-size: 14px;
+  font-weight: 760;
+  padding: 7px 12px;
 }
 
 .metric-grid {

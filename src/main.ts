@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import {
   Activity,
@@ -24,7 +25,7 @@ import {
 type TunnelType = "local" | "remote" | "dynamic";
 type AuthMethod = "password" | "key";
 type TunnelStatus = "stopped" | "running" | "exited";
-type ViewMode = "overview" | "new" | "edit";
+type ViewMode = "overview" | "new" | "edit" | "settings";
 
 type Connection = {
   id: string;
@@ -100,6 +101,7 @@ let message = "";
 let messageKind: "info" | "error" = "info";
 let monitorSamples: MonitorSample[] = [];
 let updateBusy = false;
+let appVersion = "";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 const lucideIcons = {
@@ -130,6 +132,7 @@ type I18nKey =
   | "app.subtitle"
   | "newTunnel"
   | "noTunnels"
+  | "settings"
   | "overview.title"
   | "overview.available"
   | "metric.service"
@@ -185,6 +188,14 @@ type I18nKey =
   | "message.withIssues"
   | "message.serviceStartedDetail"
   | "message.serviceStoppedDetail"
+  | "settings.title"
+  | "settings.subtitle"
+  | "settings.language"
+  | "settings.languageHint"
+  | "settings.version"
+  | "settings.versionHint"
+  | "settings.updates"
+  | "settings.updatesHint"
   | "update.check"
   | "update.checking"
   | "update.available"
@@ -198,6 +209,7 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "app.subtitle": "SSH tunnels",
     newTunnel: "New tunnel",
     noTunnels: "No tunnels yet.",
+    settings: "Settings",
     "overview.title": "Service overview",
     "overview.available": "{running} of {total} tunnel(s) available.",
     "metric.service": "Service",
@@ -253,6 +265,14 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "message.withIssues": "{action} with {count} issue(s): {issues}",
     "message.serviceStartedDetail": "Service started. {running}/{total} tunnel(s) running, {clients} client(s) connected.",
     "message.serviceStoppedDetail": "Service stopped. {total} tunnel(s) stopped, {clients} client(s) connected.",
+    "settings.title": "Settings",
+    "settings.subtitle": "Language, version, and update controls.",
+    "settings.language": "Language",
+    "settings.languageHint": "Choose the display language for the main app window.",
+    "settings.version": "Version",
+    "settings.versionHint": "Current installed Wormhole version.",
+    "settings.updates": "Updates",
+    "settings.updatesHint": "Check GitHub Releases for a signed Wormhole update.",
     "update.check": "Check updates",
     "update.checking": "Checking for updates...",
     "update.available": "Version {version} is available. Downloading...",
@@ -265,6 +285,7 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "app.subtitle": "SSH 隧道",
     newTunnel: "新增隧道",
     noTunnels: "还没有隧道。",
+    settings: "设置",
     "overview.title": "服务概览",
     "overview.available": "{running}/{total} 个隧道可用。",
     "metric.service": "服务",
@@ -320,6 +341,14 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "message.withIssues": "{action}完成，但有 {count} 个问题：{issues}",
     "message.serviceStartedDetail": "服务已启动。{running}/{total} 个隧道运行中，{clients} 个客户端已连接。",
     "message.serviceStoppedDetail": "服务已停止。{total} 个隧道已停止，{clients} 个客户端已连接。",
+    "settings.title": "设置",
+    "settings.subtitle": "语言、版本信息和更新控制。",
+    "settings.language": "语言",
+    "settings.languageHint": "选择主应用窗口的显示语言。",
+    "settings.version": "版本",
+    "settings.versionHint": "当前安装的 Wormhole 版本。",
+    "settings.updates": "更新",
+    "settings.updatesHint": "从 GitHub Releases 检查签名更新包。",
     "update.check": "检查更新",
     "update.checking": "正在检查更新...",
     "update.available": "发现版本 {version}，正在下载...",
@@ -532,10 +561,22 @@ function showOverview() {
   render();
 }
 
+function showSettings() {
+  syncDraftFromCurrentForm();
+  selectedId = null;
+  viewMode = "settings";
+  render();
+}
+
 function setLanguage(nextLanguage: Language) {
   syncDraftFromCurrentForm();
   language = nextLanguage;
   localStorage.setItem("wormhole.language", language);
+  render();
+}
+
+async function loadAppVersion() {
+  appVersion = await getVersion();
   render();
 }
 
@@ -905,6 +946,46 @@ function renderUpdateButton() {
   `;
 }
 
+function renderSettings() {
+  return `
+    <section class="settings-panel">
+      <div class="settings-heading">
+        <span class="overview-logo brand-mark">${icon("settings")}</span>
+        <div>
+          <h2>${escapeHtml(t("settings.title"))}</h2>
+          <p>${escapeHtml(t("settings.subtitle"))}</p>
+        </div>
+      </div>
+
+      <div class="settings-list">
+        <section class="settings-row">
+          <div>
+            <h3>${icon("languages")} ${escapeHtml(t("settings.language"))}</h3>
+            <p>${escapeHtml(t("settings.languageHint"))}</p>
+          </div>
+          ${renderLanguageToggle()}
+        </section>
+
+        <section class="settings-row">
+          <div>
+            <h3>${icon("route")} ${escapeHtml(t("settings.version"))}</h3>
+            <p>${escapeHtml(t("settings.versionHint"))}</p>
+          </div>
+          <strong class="version-value">${escapeHtml(appVersion || "-")}</strong>
+        </section>
+
+        <section class="settings-row">
+          <div>
+            <h3>${icon("download")} ${escapeHtml(t("settings.updates"))}</h3>
+            <p>${escapeHtml(t("settings.updatesHint"))}</p>
+          </div>
+          ${renderUpdateButton()}
+        </section>
+      </div>
+    </section>
+  `;
+}
+
 function renderQuickPanel() {
   const runningCount = connections.filter((connection) => connection.status === "running").length;
   const activeId = selectedId ?? connections[0]?.id ?? null;
@@ -1072,6 +1153,13 @@ function render() {
   }
 
   if (!app) return;
+  const workspaceContent =
+    viewMode === "overview"
+      ? renderOverview()
+      : viewMode === "settings"
+        ? renderSettings()
+        : renderForm();
+
   app.innerHTML = `
     <main class="shell">
       <aside class="sidebar">
@@ -1082,14 +1170,15 @@ function render() {
             <span>${escapeHtml(t("app.subtitle"))}</span>
           </button>
         </div>
-        ${renderLanguageToggle()}
-        ${renderUpdateButton()}
         <button type="button" class="new-button" data-action="new">${icon("plus")} ${escapeHtml(t("newTunnel"))}</button>
+        <button type="button" class="settings-button ${viewMode === "settings" ? "active" : ""}" data-action="settings">
+          ${icon("settings")} ${escapeHtml(t("settings"))}
+        </button>
         <div class="connection-list">${renderList()}</div>
       </aside>
       <section class="workspace">
         <div id="message" class="message" data-kind="${messageKind}">${escapeHtml(message)}</div>
-        ${viewMode === "overview" ? renderOverview() : renderForm()}
+        ${workspaceContent}
       </section>
     </main>
   `;
@@ -1106,6 +1195,7 @@ async function handleAction(action: string, id: string | null, lang: string | nu
   }
   if (action === "new") newConnection();
   if (action === "overview") showOverview();
+  if (action === "settings") showSettings();
   if (action === "toggle-tunnel" && id) await toggleTunnel(id);
   if (action === "delete" && id) await deleteConnection(id);
   if (action === "choose-key") await choosePrivateKey();
@@ -1181,6 +1271,7 @@ function bindAppEvents() {
 window.addEventListener("DOMContentLoaded", () => {
   bindAppEvents();
   render();
+  loadAppVersion().catch((error) => showMessage(String(error), "error"));
   loadConnections().catch((error) => showMessage(String(error), "error"));
   listen<ServiceReport>("service:started", async (event) => {
     showMessage(
