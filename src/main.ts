@@ -167,6 +167,7 @@ type I18nKey =
   | "tunnel.socks.hint"
   | "quick.running"
   | "quick.openConfig"
+  | "quick.quit"
   | "quick.noTunnels"
   | "quick.openFullApp"
   | "message.saved"
@@ -227,6 +228,7 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "tunnel.socks.hint": "Useful for browser or system proxy traffic through SSH.",
     "quick.running": "{running}/{total} tunnel(s) running",
     "quick.openConfig": "Open config",
+    "quick.quit": "Quit",
     "quick.noTunnels": "No tunnels",
     "quick.openFullApp": "Open the full app to add a tunnel.",
     "message.saved": "Saved.",
@@ -286,6 +288,7 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "tunnel.socks.hint": "常用于浏览器或系统代理，通过 SSH 转发任意目标连接。",
     "quick.running": "{running}/{total} 个隧道运行中",
     "quick.openConfig": "打开配置",
+    "quick.quit": "退出",
     "quick.noTunnels": "没有隧道",
     "quick.openFullApp": "打开完整应用添加隧道。",
     "message.saved": "已保存。",
@@ -606,6 +609,10 @@ async function choosePrivateKey() {
   render();
 }
 
+async function quitFromQuickPanel() {
+  await invoke("quit_from_quick_panel");
+}
+
 function renderList() {
   if (connections.length === 0) {
     return `<div class="empty">${escapeHtml(t("noTunnels"))}</div>`;
@@ -845,6 +852,9 @@ function renderQuickPanel() {
         <button type="button" class="quick-config-button" data-action="open-selected-config" ${activeId ? "" : "disabled"}>
           ${icon("settings")} ${escapeHtml(t("quick.openConfig"))}
         </button>
+        <button type="button" class="quick-quit-button" data-action="quit-app">
+          ${icon("power")} ${escapeHtml(t("quick.quit"))}
+        </button>
       </footer>
     </main>
   `;
@@ -1024,6 +1034,7 @@ async function handleAction(action: string, id: string | null, lang: string | nu
   if (action === "delete" && id) await deleteConnection(id);
   if (action === "choose-key") await choosePrivateKey();
   if (action === "open-selected-config") await openSelectedQuickConfig();
+  if (action === "quit-app") await quitFromQuickPanel();
   if (action === "language" && (lang === "en" || lang === "zh")) setLanguage(lang);
 }
 

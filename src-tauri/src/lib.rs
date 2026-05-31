@@ -24,7 +24,6 @@ const MENU_SHOW: &str = "show";
 const MENU_HIDE: &str = "hide";
 const MENU_START_SERVICE: &str = "start_service";
 const MENU_STOP_SERVICE: &str = "stop_service";
-const MENU_QUIT: &str = "quit";
 const TRAY_ID: &str = "wormhole";
 const TRAY_ICON_SIZE: usize = 18;
 const QUICK_PANEL_LABEL: &str = "quick-panel";
@@ -704,6 +703,7 @@ fn local_listener_pid_from_lsof_line(line: &str) -> Option<(u16, u32)> {
 }
 
 fn show_main_window(app: &AppHandle) {
+    let _ = app.set_dock_visibility(true);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -715,6 +715,13 @@ fn hide_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
+    let _ = app.set_dock_visibility(false);
+}
+
+fn quit_app(app: &AppHandle) {
+    let runtime = app.state::<RuntimeState>();
+    let _ = stop_service_with_runtime(&runtime);
+    app.exit(0);
 }
 
 fn toggle_quick_panel(app: &AppHandle, position: PhysicalPosition<f64>) {
@@ -891,8 +898,6 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .separator()
         .text(MENU_START_SERVICE, "Start Service")
         .text(MENU_STOP_SERVICE, "Stop Service")
-        .separator()
-        .text(MENU_QUIT, "Quit Wormhole")
         .build()?;
 
     let tray = TrayIconBuilder::with_id(TRAY_ID)
@@ -916,11 +921,6 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
                 let report = stop_service_with_runtime(&runtime);
                 emit_service_report(app, "stopped", report);
                 update_tray_status(app);
-            }
-            MENU_QUIT => {
-                let runtime = app.state::<RuntimeState>();
-                let _ = stop_service_with_runtime(&runtime);
-                app.exit(0);
             }
             _ => {}
         })
@@ -1077,6 +1077,11 @@ fn open_full_config(id: String, app: AppHandle) {
     hide_quick_panel_window(&app);
 }
 
+#[tauri::command]
+fn quit_from_quick_panel(app: AppHandle) {
+    quit_app(&app);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1103,6 +1108,9 @@ pub fn run() {
                 if window.label() == "main" || window.label() == QUICK_PANEL_LABEL {
                     api.prevent_close();
                     let _ = window.hide();
+                    if window.label() == "main" {
+                        let _ = window.app_handle().set_dock_visibility(false);
+                    }
                 }
             }
         })
@@ -1116,7 +1124,8 @@ pub fn run() {
             stop_service,
             service_status,
             choose_private_key,
-            open_full_config
+            open_full_config,
+            quit_from_quick_panel
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

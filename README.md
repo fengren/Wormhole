@@ -1,30 +1,168 @@
 # Wormhole
 
-Wormhole is a macOS SSH tunnel manager built with Tauri and vanilla TypeScript.
+Wormhole is a macOS SSH tunnel manager built with Tauri 2 and vanilla TypeScript. It gives you a desktop UI and a menu bar quick panel for creating, starting, stopping, and monitoring SSH port forwarding profiles.
+
+[中文文档](README_zh.md)
 
 ## Features
 
-- Save SSH tunnel profiles locally.
-- Store passwords and key passphrases in the macOS keychain.
-- Start and stop local, remote, and dynamic SOCKS forwarding with the system `ssh` command.
-- Show live tunnel process state in the desktop UI.
-- Control the app from the macOS menu bar.
-- Show the current local client count in the macOS menu bar.
-- Start or stop the service, which starts or stops all saved tunnel profiles.
+- Manage reusable SSH tunnel profiles in a local desktop app.
+- Support Local, Remote, and SOCKS tunnel modes.
+- Start and stop each tunnel through the system OpenSSH `ssh` command.
+- Store SSH passwords and private key passphrases in the macOS Keychain.
+- Choose private key files from the UI, defaulting to the current user's `~/.ssh` directory.
+- Show tunnel runtime state, local client count, and best-effort traffic metrics.
+- Monitor traffic and client connection history from the Overview page.
+- Control tunnels from a macOS menu bar quick panel.
+- Keep tunnels running when the main window is closed.
+- Stop tunnels automatically when the app quits.
+- Switch the main UI between English and Chinese.
+- Build macOS release bundles from GitHub tags with GitHub Actions.
+
+## Tunnel Types
+
+### Local Forwarding
+
+Local forwarding exposes a local port on your Mac and forwards traffic through SSH to a host and port reachable from the SSH server.
+
+Example use cases:
+
+- Connect to a private database through a bastion host.
+- Access an internal web service without opening it publicly.
+- Forward `127.0.0.1:15432` to `db.internal:5432`.
+
+### Remote Forwarding
+
+Remote forwarding opens a port on the SSH server and forwards incoming traffic back to a service running on your Mac or local network.
+
+Example use cases:
+
+- Temporarily expose a local development service to a remote machine.
+- Let a remote server call back into a local test endpoint.
+- Forward `remote:9000` to `127.0.0.1:3000`.
+
+### SOCKS Proxy
+
+SOCKS mode creates a local dynamic proxy. Applications that support SOCKS can send traffic through the SSH connection without defining a fixed destination in the tunnel profile.
+
+Example use cases:
+
+- Route browser traffic through an SSH server.
+- Test network access from a different environment.
+- Create a local SOCKS proxy such as `127.0.0.1:1080`.
+
+## Menu Bar Quick Panel
+
+Wormhole runs from the macOS menu bar. Clicking the menu bar icon opens a compact quick panel where you can:
+
+- See saved tunnels and their current state.
+- Start or stop an individual tunnel.
+- Open the full configuration window.
+- Quit the app.
+
+Closing the main window only hides it. The app stays in the menu bar and any running tunnels continue to run. Quitting from the quick panel stops running tunnels before the app exits.
+
+## Runtime Metrics
+
+The Overview page shows:
+
+- Number of saved tunnels.
+- Number of running tunnels.
+- Local client connections.
+- Current traffic rate.
+- Total sampled traffic.
+- Traffic and connection history charts.
+
+Metrics are best-effort because Wormhole delegates tunnel execution to OpenSSH and observes local system state from outside the `ssh` process.
+
+## Requirements
+
+- macOS.
+- Node.js 20 or newer.
+- Rust stable toolchain.
+- OpenSSH `ssh` available in `PATH`.
+- Git, if you want to use the release workflow.
 
 ## Development
 
+Install dependencies:
+
 ```sh
 npm install
-npm run build
-cargo check --manifest-path src-tauri/Cargo.toml
+```
+
+Run the app in development mode:
+
+```sh
 npm run tauri dev
 ```
 
-## Notes
+Build the frontend:
 
-Wormhole delegates forwarding to OpenSSH. Key authentication works with private key files and the local SSH agent. Password authentication and encrypted key passphrases are provided to `ssh` through an askpass helper generated in the app config directory.
+```sh
+npm run build
+```
 
-Closing the main window hides it so tunnels can continue running. Use the menu bar icon to show the window again or quit the app.
+Run Rust checks only:
 
-The menu bar client count is calculated from local established TCP sockets connected to local and SOCKS forwarding ports. Remote forwarding clients connect on the remote host and are not visible to this local counter.
+```sh
+cargo check --manifest-path src-tauri/Cargo.toml
+```
+
+Run the full test command:
+
+```sh
+npm test
+```
+
+`npm test` builds the frontend and runs the Rust test suite.
+
+## Release
+
+The repository includes a GitHub Actions workflow at `.github/workflows/release.yml`.
+
+Pushing a tag that matches `v*` starts the release workflow:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow runs on macOS, installs Node.js and Rust, runs `npm test`, builds the Tauri app, and creates a draft GitHub release with the generated macOS bundles.
+
+Code signing and notarization are not configured in this repository by default. Add your Apple Developer signing configuration before publishing production builds.
+
+## Data and Credentials
+
+Tunnel profiles are stored locally by the app. Sensitive credentials are stored separately:
+
+- SSH passwords are saved in the macOS Keychain.
+- Private key passphrases are saved in the macOS Keychain.
+- Password and passphrase authentication are provided to OpenSSH through an askpass helper generated by the app.
+
+Wormhole does not implement SSH itself. It launches the system `ssh` binary with the tunnel options required by each profile.
+
+## Notes and Limitations
+
+- Wormhole is currently macOS-focused.
+- OpenSSH behavior, host key verification, SSH agent behavior, and SSH config resolution come from the system `ssh` command.
+- Client count is calculated from local established TCP sockets on local and SOCKS forwarding ports.
+- Remote forwarding clients connect on the remote host, so they are not always visible to local client counters.
+- Traffic metrics are sampled from local process/network information and should be treated as operational indicators, not billing-grade accounting.
+- If a tunnel cannot be stopped normally, Wormhole attempts to clean up the associated `ssh` process.
+
+## Project Structure
+
+```text
+.
+|-- src/                 # Frontend TypeScript, UI rendering, styles
+|-- src-tauri/           # Tauri/Rust backend, SSH process management, tray integration
+|-- .github/workflows/   # GitHub Actions release workflow
+|-- package.json         # Frontend and Tauri scripts
+|-- README.md            # English documentation
+`-- README_zh.md         # Chinese documentation
+```
+
+## License
+
+No license file is currently included. Add a license before distributing the project publicly.

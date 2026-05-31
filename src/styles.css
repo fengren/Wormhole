@@ -955,3 +955,23 @@ input:focus {
   border-color: #8db9af;
   background: #f1faf7;
 }
+
+.quick-quit-button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid #efb4ac;
+  border-radius: 8px;
+  background: #fff7f5;
+  color: #b42318;
+  font-size: 13px;
+  font-weight: 750;
+  padding: 8px 12px;
+}
+
+.quick-quit-button:hover {
+  border-color: #dc2626;
+  background: #fff1ef;
+}
