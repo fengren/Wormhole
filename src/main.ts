@@ -28,6 +28,7 @@ type AuthProfile = "normal" | "mfa";
 type StartMode = "manual" | "on_demand" | "always";
 type TunnelStatus = "stopped" | "running" | "exited" | "dormant" | "needs_auth";
 type ViewMode = "overview" | "new" | "edit" | "settings";
+type UpdateState = "idle" | "checking" | "downloading" | "installed";
 
 type Connection = {
   id: string;
@@ -110,7 +111,8 @@ let serviceStatus: ServiceStatus = {
 let message = "";
 let messageKind: "info" | "error" = "info";
 let monitorSamples: MonitorSample[] = [];
-let updateBusy = false;
+let updateState: UpdateState = "idle";
+let updateProgress = 0;
 let appVersion = "";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -204,7 +206,6 @@ type I18nKey =
   | "quick.openFullApp"
   | "message.saved"
   | "message.deleted"
-  | "message.tunnelStarted"
   | "message.tunnelStopped"
   | "message.serviceStarted"
   | "message.serviceStopped"
@@ -224,7 +225,9 @@ type I18nKey =
   | "update.available"
   | "update.notAvailable"
   | "update.downloading"
+  | "update.downloadingUnknown"
   | "update.installed"
+  | "update.restart"
   | "update.failed";
 
 const translations: Record<Language, Record<I18nKey, string>> = {
@@ -294,7 +297,6 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "quick.openFullApp": "Open the full app to add a tunnel.",
     "message.saved": "Saved.",
     "message.deleted": "Deleted.",
-    "message.tunnelStarted": "Tunnel started.",
     "message.tunnelStopped": "Tunnel stopped.",
     "message.serviceStarted": "Started",
     "message.serviceStopped": "Stopped",
@@ -314,7 +316,9 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "update.available": "Version {version} is available. Downloading...",
     "update.notAvailable": "Wormhole is up to date.",
     "update.downloading": "Downloading update: {progress}%",
+    "update.downloadingUnknown": "Downloading update...",
     "update.installed": "Update installed. Restart Wormhole to apply it.",
+    "update.restart": "Restart",
     "update.failed": "Update failed: {error}",
   },
   zh: {
@@ -383,7 +387,6 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "quick.openFullApp": "打开完整应用添加隧道。",
     "message.saved": "已保存。",
     "message.deleted": "已删除。",
-    "message.tunnelStarted": "隧道已启动。",
     "message.tunnelStopped": "隧道已停止。",
     "message.serviceStarted": "启动",
     "message.serviceStopped": "停止",
@@ -403,7 +406,9 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "update.available": "发现版本 {version}，正在下载...",
     "update.notAvailable": "Wormhole 已是最新版本。",
     "update.downloading": "正在下载更新：{progress}%",
+    "update.downloadingUnknown": "正在下载更新...",
     "update.installed": "更新已安装，重启 Wormhole 后生效。",
+    "update.restart": "重启",
     "update.failed": "更新失败：{error}",
   },
 };
@@ -669,7 +674,6 @@ async function startTunnel(id: string) {
   render();
   try {
     await invoke<Connection>("start_tunnel", { id });
-    showMessage(t("message.tunnelStarted"));
     await loadConnections();
   } catch (error) {
     showMessage(String(error), "error");
@@ -738,9 +742,26 @@ async function quitFromQuickPanel() {
   await invoke("quit_from_quick_panel");
 }
 
+function updateButtonText() {
+  if (updateState === "checking") return t("update.checking");
+  if (updateState === "downloading") {
+    if (updateProgress <= 0) return t("update.downloadingUnknown");
+    return t("update.downloading", { progress: updateProgress });
+  }
+  if (updateState === "installed") return t("update.restart");
+  return t("update.check");
+}
+
+function updateButtonIcon() {
+  if (updateState === "installed") return "refresh-cw";
+  if (updateState === "idle") return "download";
+  return "refresh-cw";
+}
+
 async function checkForUpdates() {
-  if (updateBusy) return;
-  updateBusy = true;
+  if (updateState === "checking" || updateState === "downloading") return;
+  updateState = "checking";
+  updateProgress = 0;
   render();
   showMessage(t("update.checking"));
 
@@ -748,6 +769,7 @@ async function checkForUpdates() {
     const update = await check();
     if (!update) {
       showMessage(t("update.notAvailable"));
+      updateState = "idle";
       return;
     }
 
@@ -756,26 +778,33 @@ async function checkForUpdates() {
     let total = 0;
     await update.downloadAndInstall((event) => {
       if (event.event === "Started") {
+        updateState = "downloading";
         total = event.data.contentLength ?? 0;
         downloaded = 0;
+        updateProgress = 0;
+        render();
       } else if (event.event === "Progress") {
         downloaded += event.data.chunkLength;
         if (total > 0) {
-          showMessage(
-            t("update.downloading", {
-              progress: Math.min(100, Math.round((downloaded / total) * 100)),
-            }),
-          );
+          updateProgress = Math.min(100, Math.round((downloaded / total) * 100));
         }
+        render();
       }
     });
+    updateState = "installed";
+    updateProgress = 100;
     showMessage(t("update.installed"));
   } catch (error) {
+    updateState = "idle";
+    updateProgress = 0;
     showMessage(t("update.failed", { error: String(error) }), "error");
   } finally {
-    updateBusy = false;
     render();
   }
+}
+
+async function restartApp() {
+  await invoke("restart_app");
 }
 
 function renderList() {
@@ -996,9 +1025,12 @@ function renderLanguageToggle() {
 }
 
 function renderUpdateButton() {
+  const busy = updateState === "checking" || updateState === "downloading";
+  const action = updateState === "installed" ? "restart-app" : "check-update";
+
   return `
-    <button type="button" class="update-button" data-action="check-update" ${updateBusy ? "disabled" : ""}>
-      ${icon(updateBusy ? "refresh-cw" : "download")} ${escapeHtml(updateBusy ? t("update.checking") : t("update.check"))}
+    <button type="button" class="update-button" data-action="${action}" ${busy ? "disabled" : ""}>
+      ${icon(updateButtonIcon())} ${escapeHtml(updateButtonText())}
     </button>
   `;
 }
@@ -1289,6 +1321,7 @@ async function handleAction(action: string, id: string | null, lang: string | nu
   if (action === "open-selected-config") await openSelectedQuickConfig();
   if (action === "quit-app") await quitFromQuickPanel();
   if (action === "check-update" && !isQuickPanel) await checkForUpdates();
+  if (action === "restart-app" && !isQuickPanel) await restartApp();
   if (action === "language" && (lang === "en" || lang === "zh")) setLanguage(lang);
 }
 

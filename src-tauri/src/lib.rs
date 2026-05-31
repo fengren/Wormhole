@@ -34,6 +34,8 @@ const TRAY_ICON_SIZE: usize = 18;
 const QUICK_PANEL_LABEL: &str = "quick-panel";
 const QUICK_PANEL_WIDTH: f64 = 360.0;
 const QUICK_PANEL_HEIGHT: f64 = 480.0;
+const ON_DEMAND_READY_ATTEMPTS: usize = 100;
+const ON_DEMAND_READY_SLEEP: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -500,6 +502,7 @@ fn start_on_demand_listener(
         .insert(config.id.clone(), OnDemandHandle { stop: stop.clone() });
 
     let id = config.id.clone();
+    let listener_app = app.clone();
     thread::spawn(move || loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -519,7 +522,11 @@ fn start_on_demand_listener(
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
             }
-            Err(_) => break,
+            Err(_) => {
+                let runtime = listener_app.state::<RuntimeState>();
+                stop_on_demand_listener(&runtime, &id);
+                break;
+            }
         }
     });
 
@@ -586,8 +593,18 @@ fn ensure_on_demand_upstream(runtime: &RuntimeState, config: &SshConfig) -> Resu
         }
     };
 
-    start_ssh_child(runtime, config, Some(upstream_port))?;
-    wait_for_loopback_port(upstream_port)?;
+    if let Err(error) = start_ssh_child(runtime, config, Some(upstream_port))
+        .and_then(|_| wait_for_loopback_port(upstream_port))
+    {
+        stop_ssh_child(runtime, &config.id);
+        runtime
+            .upstream_ports
+            .lock()
+            .expect("runtime lock poisoned")
+            .remove(&config.id);
+        return Err(error);
+    }
+
     Ok(upstream_port)
 }
 
@@ -600,12 +617,12 @@ fn allocate_loopback_port() -> Result<u16, String> {
 }
 
 fn wait_for_loopback_port(port: u16) -> Result<(), String> {
-    let ports = HashSet::from([port]);
-    for _ in 0..30 {
-        if listening_local_ports(&ports).contains(&port) {
+    for _ in 0..ON_DEMAND_READY_ATTEMPTS {
+        if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
+            let _ = stream.shutdown(Shutdown::Both);
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(ON_DEMAND_READY_SLEEP);
     }
     Err(format!("Timed out waiting for local tunnel endpoint on {port}."))
 }
@@ -1478,6 +1495,11 @@ fn quit_from_quick_panel(app: AppHandle) {
     quit_app(&app);
 }
 
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    app.request_restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1527,7 +1549,8 @@ pub fn run() {
             service_status,
             choose_private_key,
             open_full_config,
-            quit_from_quick_panel
+            quit_from_quick_panel,
+            restart_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
