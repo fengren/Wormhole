@@ -16,6 +16,41 @@ pub enum AuthMethod {
     Key,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthProfile {
+    Normal,
+    Mfa,
+}
+
+impl Default for AuthProfile {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum StartMode {
+    Manual,
+    OnDemand,
+    Always,
+}
+
+impl Default for StartMode {
+    fn default() -> Self {
+        Self::Manual
+    }
+}
+
+fn default_auto_reconnect() -> bool {
+    true
+}
+
+fn default_idle_timeout_seconds() -> u64 {
+    600
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshConfig {
     pub id: String,
@@ -29,6 +64,14 @@ pub struct SshConfig {
     pub local_port: u16,
     pub remote_host: Option<String>,
     pub remote_port: Option<u16>,
+    #[serde(default)]
+    pub auth_profile: AuthProfile,
+    #[serde(default)]
+    pub start_mode: StartMode,
+    #[serde(default = "default_auto_reconnect")]
+    pub auto_reconnect: bool,
+    #[serde(default = "default_idle_timeout_seconds")]
+    pub idle_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

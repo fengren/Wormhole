@@ -30,7 +30,8 @@ body.quick-panel-mode {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -331,6 +332,18 @@ button:disabled {
   color: #9a4a14;
 }
 
+.connection-icon.dormant {
+  border-color: #a9c9dd;
+  background: #edf7fd;
+  color: #1f6f94;
+}
+
+.connection-icon.needs_auth {
+  border-color: #e7b6b1;
+  background: #fff0ef;
+  color: #b42318;
+}
+
 .connection-main {
   display: grid;
   min-width: 0;
@@ -407,6 +420,16 @@ button:disabled {
   background: #f3c19c;
 }
 
+.tunnel-toggle.dormant .toggle-track {
+  border-color: #74a9c8;
+  background: #9dd4ef;
+}
+
+.tunnel-toggle.needs_auth .toggle-track {
+  border-color: #e7b6b1;
+  background: #f3b6b0;
+}
+
 .tunnel-toggle:disabled .toggle-track {
   opacity: 0.62;
 }
@@ -433,6 +456,16 @@ button:disabled {
 .status.exited {
   background: #fff2e9;
   color: #9a4a14;
+}
+
+.status.dormant {
+  background: #edf7fd;
+  color: #1f6f94;
+}
+
+.status.needs_auth {
+  background: #fff0ef;
+  color: #b42318;
 }
 
 .empty {
@@ -731,8 +764,10 @@ label {
   font-weight: 720;
 }
 
-input {
+input,
+select {
   width: 100%;
+  height: 40px;
   min-height: 40px;
   border: 1px solid #cbd5d1;
   border-radius: 8px;
@@ -742,9 +777,81 @@ input {
   padding: 8px 11px;
 }
 
-input:focus {
+select {
+  appearance: none;
+  background:
+    linear-gradient(45deg, transparent 50%, #60706c 50%) right 14px center / 6px 6px no-repeat,
+    linear-gradient(135deg, #60706c 50%, transparent 50%) right 10px center / 6px 6px no-repeat,
+    #ffffff;
+  padding-right: 32px;
+}
+
+input:focus,
+select:focus {
   border-color: #52a691;
   box-shadow: 0 0 0 3px rgba(82, 166, 145, 0.16);
+}
+
+.policy-panel {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #dde4e1;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 14px;
+}
+
+.policy-panel summary {
+  display: flex;
+  align-items: center;
+  color: #111918;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.policy-panel summary::-webkit-details-marker {
+  display: none;
+}
+
+.policy-panel summary::after {
+  margin-left: auto;
+  color: #71817d;
+  content: "v";
+  font-size: 16px;
+  line-height: 1;
+  transition: transform 160ms ease;
+}
+
+.policy-panel[open] summary::after {
+  transform: rotate(180deg);
+}
+
+.policy-panel h3,
+.policy-panel summary {
+  margin: 0;
+  color: #111918;
+  font-size: 14px;
+  font-weight: 760;
+}
+
+.policy-panel p {
+  margin: 0;
+  color: #71817d;
+  font-size: 12px;
+}
+
+.checkbox-row {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+}
+
+.checkbox-row input {
+  width: 17px;
+  min-height: 17px;
 }
 
 .input-with-action {

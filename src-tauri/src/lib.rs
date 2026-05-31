@@ -1,13 +1,18 @@
 mod config;
 mod keychain;
 
-use config::{AuthMethod, SshConfig, TunnelType};
+use config::{AuthMethod, AuthProfile, SshConfig, StartMode, TunnelType};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
+    io::Write,
+    net::{Shutdown, TcpListener, TcpStream},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -31,11 +36,13 @@ const QUICK_PANEL_WIDTH: f64 = 360.0;
 const QUICK_PANEL_HEIGHT: f64 = 480.0;
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum TunnelStatus {
     Stopped,
     Running,
     Exited,
+    Dormant,
+    NeedsAuth,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,11 +67,24 @@ struct ConnectionInput {
     local_port: u16,
     remote_host: Option<String>,
     remote_port: Option<u16>,
+    auth_profile: AuthProfile,
+    start_mode: StartMode,
+    auto_reconnect: bool,
+    idle_timeout_seconds: u64,
 }
 
 struct RuntimeState {
     children: Mutex<HashMap<String, Child>>,
     traffic: Mutex<Option<TrafficSnapshot>>,
+    desired: Mutex<HashSet<String>>,
+    on_demand: Mutex<HashMap<String, OnDemandHandle>>,
+    upstream_ports: Mutex<HashMap<String, u16>>,
+    last_activity: Mutex<HashMap<String, Instant>>,
+    needs_auth: Mutex<HashSet<String>>,
+}
+
+struct OnDemandHandle {
+    stop: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +147,18 @@ fn validate_config(config: &SshConfig) -> Result<(), String> {
 }
 
 fn to_config(input: ConnectionInput) -> SshConfig {
+    let auth_profile = input.auth_profile;
+    let start_mode = if matches!(auth_profile, AuthProfile::Mfa)
+        || matches!(input.tunnel_type, TunnelType::Remote)
+    {
+        match input.start_mode {
+            StartMode::OnDemand => StartMode::Always,
+            mode => mode,
+        }
+    } else {
+        input.start_mode
+    };
+
     SshConfig {
         id: input.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         name: input.name.trim().to_string(),
@@ -145,6 +177,10 @@ fn to_config(input: ConnectionInput) -> SshConfig {
             .map(|host| host.trim().to_string())
             .filter(|host| !host.is_empty()),
         remote_port: input.remote_port,
+        auth_profile,
+        start_mode,
+        auto_reconnect: input.auto_reconnect,
+        idle_timeout_seconds: input.idle_timeout_seconds.max(30),
     }
 }
 
@@ -191,6 +227,24 @@ fn tunnel_status(
 ) -> TunnelStatus {
     match mark_status(runtime, &config.id) {
         TunnelStatus::Running => TunnelStatus::Running,
+        TunnelStatus::Exited if matches!(config.auth_profile, AuthProfile::Mfa) => {
+            runtime
+                .needs_auth
+                .lock()
+                .expect("runtime lock poisoned")
+                .insert(config.id.clone());
+            TunnelStatus::NeedsAuth
+        }
+        _ if matches!(config.auth_profile, AuthProfile::Mfa)
+            && runtime
+                .needs_auth
+                .lock()
+                .expect("runtime lock poisoned")
+                .contains(&config.id) =>
+        {
+            TunnelStatus::NeedsAuth
+        }
+        _ if has_on_demand_listener(runtime, &config.id) => TunnelStatus::Dormant,
         _ if !matches!(config.tunnel_type, TunnelType::Remote)
             && listening_ports.contains(&config.local_port) =>
         {
@@ -198,6 +252,14 @@ fn tunnel_status(
         }
         status => status,
     }
+}
+
+fn has_on_demand_listener(runtime: &RuntimeState, id: &str) -> bool {
+    runtime
+        .on_demand
+        .lock()
+        .expect("runtime lock poisoned")
+        .contains_key(id)
 }
 
 fn active_tunnel_ids(runtime: &RuntimeState) -> HashSet<String> {
@@ -231,25 +293,31 @@ fn askpass_path() -> Result<std::path::PathBuf, String> {
     Ok(path)
 }
 
+#[cfg(test)]
 fn tunnel_arg(config: &SshConfig) -> String {
+    tunnel_arg_with_local_port(config, config.local_port)
+}
+
+fn tunnel_arg_with_local_port(config: &SshConfig, local_port: u16) -> String {
     match config.tunnel_type {
         TunnelType::Local => format!(
             "{}:{}:{}",
-            config.local_port,
+            local_port,
             config.remote_host.as_deref().unwrap_or("127.0.0.1"),
             config.remote_port.unwrap_or(0)
         ),
         TunnelType::Remote => format!(
             "{}:{}:{}",
-            config.local_port,
+            local_port,
             config.remote_host.as_deref().unwrap_or("127.0.0.1"),
             config.remote_port.unwrap_or(0)
         ),
-        TunnelType::Dynamic => config.local_port.to_string(),
+        TunnelType::Dynamic => local_port.to_string(),
     }
 }
 
-fn spawn_ssh(config: &SshConfig) -> Result<Child, String> {
+fn spawn_ssh(config: &SshConfig, local_port_override: Option<u16>) -> Result<Child, String> {
+    let local_port = local_port_override.unwrap_or(config.local_port);
     let mut command = Command::new("ssh");
     command
         .arg("-N")
@@ -267,13 +335,13 @@ fn spawn_ssh(config: &SshConfig) -> Result<Child, String> {
 
     match config.tunnel_type {
         TunnelType::Local => {
-            command.arg("-L").arg(tunnel_arg(config));
+            command.arg("-L").arg(tunnel_arg_with_local_port(config, local_port));
         }
         TunnelType::Remote => {
-            command.arg("-R").arg(tunnel_arg(config));
+            command.arg("-R").arg(tunnel_arg_with_local_port(config, local_port));
         }
         TunnelType::Dynamic => {
-            command.arg("-D").arg(tunnel_arg(config));
+            command.arg("-D").arg(tunnel_arg_with_local_port(config, local_port));
         }
     }
 
@@ -318,8 +386,31 @@ fn spawn_ssh(config: &SshConfig) -> Result<Child, String> {
         })
 }
 
-fn start_config(runtime: &RuntimeState, config: SshConfig) -> Result<ConnectionView, String> {
+fn start_config(
+    runtime: &RuntimeState,
+    config: SshConfig,
+    app: Option<AppHandle>,
+) -> Result<ConnectionView, String> {
     validate_config(&config)?;
+
+    runtime
+        .desired
+        .lock()
+        .expect("runtime lock poisoned")
+        .insert(config.id.clone());
+
+    if matches!(config.start_mode, StartMode::OnDemand)
+        && !matches!(config.auth_profile, AuthProfile::Mfa)
+        && !matches!(config.tunnel_type, TunnelType::Remote)
+    {
+        if let Some(app) = app {
+            start_on_demand_listener(runtime, config.clone(), app)?;
+            return Ok(ConnectionView {
+                config,
+                status: TunnelStatus::Dormant,
+            });
+        }
+    }
 
     if !matches!(config.tunnel_type, TunnelType::Remote) {
         let ports = HashSet::from([config.local_port]);
@@ -344,12 +435,7 @@ fn start_config(runtime: &RuntimeState, config: SshConfig) -> Result<ConnectionV
         }
     }
 
-    let child = spawn_ssh(&config)?;
-    runtime
-        .children
-        .lock()
-        .expect("runtime lock poisoned")
-        .insert(config.id.clone(), child);
+    start_ssh_child(runtime, &config, None)?;
 
     Ok(ConnectionView {
         config,
@@ -357,7 +443,208 @@ fn start_config(runtime: &RuntimeState, config: SshConfig) -> Result<ConnectionV
     })
 }
 
+fn start_ssh_child(
+    runtime: &RuntimeState,
+    config: &SshConfig,
+    local_port_override: Option<u16>,
+) -> Result<(), String> {
+    {
+        let mut children = runtime.children.lock().expect("runtime lock poisoned");
+        if let Some(child) = children.get_mut(&config.id) {
+            if child.try_wait().map_err(|err| err.to_string())?.is_none() {
+                return Ok(());
+            }
+            children.remove(&config.id);
+        }
+    }
+
+    let child = spawn_ssh(config, local_port_override)?;
+    runtime
+        .children
+        .lock()
+        .expect("runtime lock poisoned")
+        .insert(config.id.clone(), child);
+    runtime
+        .last_activity
+        .lock()
+        .expect("runtime lock poisoned")
+        .insert(config.id.clone(), Instant::now());
+    runtime
+        .needs_auth
+        .lock()
+        .expect("runtime lock poisoned")
+        .remove(&config.id);
+    Ok(())
+}
+
+fn start_on_demand_listener(
+    runtime: &RuntimeState,
+    config: SshConfig,
+    app: AppHandle,
+) -> Result<(), String> {
+    if has_on_demand_listener(runtime, &config.id) {
+        return Ok(());
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", config.local_port))
+        .map_err(|err| format!("Could not listen on local port {}: {err}", config.local_port))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| err.to_string())?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    runtime
+        .on_demand
+        .lock()
+        .expect("runtime lock poisoned")
+        .insert(config.id.clone(), OnDemandHandle { stop: stop.clone() });
+
+    let id = config.id.clone();
+    thread::spawn(move || loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        match listener.accept() {
+            Ok((client, _)) => {
+                let app = app.clone();
+                let id = id.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_on_demand_client(&app, &id, client) {
+                        eprintln!("on-demand tunnel failed for {id}: {error}");
+                    }
+                    update_tray_status(&app);
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    });
+
+    Ok(())
+}
+
+fn stop_on_demand_listener(runtime: &RuntimeState, id: &str) {
+    if let Some(handle) = runtime
+        .on_demand
+        .lock()
+        .expect("runtime lock poisoned")
+        .remove(id)
+    {
+        handle.stop.store(true, Ordering::Relaxed);
+    }
+    runtime
+        .upstream_ports
+        .lock()
+        .expect("runtime lock poisoned")
+        .remove(id);
+    runtime
+        .needs_auth
+        .lock()
+        .expect("runtime lock poisoned")
+        .remove(id);
+}
+
+fn handle_on_demand_client(app: &AppHandle, id: &str, client: TcpStream) -> Result<(), String> {
+    let config = find_config(id)?;
+    if matches!(config.auth_profile, AuthProfile::Mfa) {
+        return Err("MFA tunnels must be started manually.".to_string());
+    }
+    let runtime = app.state::<RuntimeState>();
+    let upstream_port = ensure_on_demand_upstream(&runtime, &config)?;
+    let upstream = TcpStream::connect(("127.0.0.1", upstream_port))
+        .map_err(|err| format!("Could not connect to local tunnel endpoint: {err}"))?;
+
+    runtime
+        .last_activity
+        .lock()
+        .expect("runtime lock poisoned")
+        .insert(config.id.clone(), Instant::now());
+    let result = proxy_streams(client, upstream);
+    runtime
+        .last_activity
+        .lock()
+        .expect("runtime lock poisoned")
+        .insert(config.id.clone(), Instant::now());
+    result
+}
+
+fn ensure_on_demand_upstream(runtime: &RuntimeState, config: &SshConfig) -> Result<u16, String> {
+    let upstream_port = {
+        let mut ports = runtime
+            .upstream_ports
+            .lock()
+            .expect("runtime lock poisoned");
+        if let Some(port) = ports.get(&config.id).copied() {
+            port
+        } else {
+            let port = allocate_loopback_port()?;
+            ports.insert(config.id.clone(), port);
+            port
+        }
+    };
+
+    start_ssh_child(runtime, config, Some(upstream_port))?;
+    wait_for_loopback_port(upstream_port)?;
+    Ok(upstream_port)
+}
+
+fn allocate_loopback_port() -> Result<u16, String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|err| err.to_string())?;
+    listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .map_err(|err| err.to_string())
+}
+
+fn wait_for_loopback_port(port: u16) -> Result<(), String> {
+    let ports = HashSet::from([port]);
+    for _ in 0..30 {
+        if listening_local_ports(&ports).contains(&port) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("Timed out waiting for local tunnel endpoint on {port}."))
+}
+
+fn proxy_streams(client: TcpStream, upstream: TcpStream) -> Result<(), String> {
+    let mut client_reader = client.try_clone().map_err(|err| err.to_string())?;
+    let mut client_writer = client;
+    let mut upstream_reader = upstream.try_clone().map_err(|err| err.to_string())?;
+    let mut upstream_writer = upstream;
+
+    let upload = thread::spawn(move || {
+        let _ = io::copy(&mut client_reader, &mut upstream_writer);
+        let _ = upstream_writer.flush();
+        let _ = upstream_writer.shutdown(Shutdown::Write);
+    });
+    let download = thread::spawn(move || {
+        let _ = io::copy(&mut upstream_reader, &mut client_writer);
+        let _ = client_writer.flush();
+        let _ = client_writer.shutdown(Shutdown::Write);
+    });
+
+    let _ = upload.join();
+    let _ = download.join();
+    Ok(())
+}
+
 fn stop_tunnel_by_id(runtime: &RuntimeState, id: &str) -> Result<(), String> {
+    runtime
+        .desired
+        .lock()
+        .expect("runtime lock poisoned")
+        .remove(id);
+    runtime
+        .needs_auth
+        .lock()
+        .expect("runtime lock poisoned")
+        .remove(id);
+    stop_on_demand_listener(runtime, id);
+
     let child = runtime
         .children
         .lock()
@@ -376,7 +663,7 @@ fn stop_tunnel_by_id(runtime: &RuntimeState, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn start_service_with_runtime(runtime: &RuntimeState) -> ServiceReport {
+fn start_service_with_runtime(runtime: &RuntimeState, app: Option<AppHandle>) -> ServiceReport {
     let connections = config::load_state().connections;
     let total = connections.len();
     let mut started = 0;
@@ -384,9 +671,9 @@ fn start_service_with_runtime(runtime: &RuntimeState) -> ServiceReport {
 
     for config in connections {
         let name = config.name.clone();
-        match start_config(runtime, config) {
+        match start_config(runtime, config, app.clone()) {
             Ok(view) => {
-                if matches!(view.status, TunnelStatus::Running) {
+                if matches!(view.status, TunnelStatus::Running | TunnelStatus::Dormant) {
                     started += 1;
                 }
             }
@@ -471,8 +758,9 @@ fn kill_pid(pid: u32) -> Result<(), String> {
 }
 
 fn service_status_with_runtime(runtime: &RuntimeState) -> ServiceStatus {
-    let active_ids = active_tunnel_ids(runtime);
     let connections = config::load_state().connections;
+    apply_idle_policy(runtime, &connections);
+    let active_ids = active_tunnel_ids(runtime);
     let local_ports: HashSet<u16> = connections
         .iter()
         .filter(|connection| !matches!(connection.tunnel_type, TunnelType::Remote))
@@ -483,6 +771,7 @@ fn service_status_with_runtime(runtime: &RuntimeState) -> ServiceStatus {
         .iter()
         .filter(|connection| {
             !matches!(connection.tunnel_type, TunnelType::Remote)
+                && !has_on_demand_listener(runtime, &connection.id)
                 && listening_ports.contains(&connection.local_port)
         })
         .count();
@@ -495,6 +784,101 @@ fn service_status_with_runtime(runtime: &RuntimeState) -> ServiceStatus {
         clients: count_local_clients(&local_ports),
         traffic_bytes_per_second: traffic.0,
         traffic_bytes_total: traffic.1,
+    }
+}
+
+fn apply_idle_policy(runtime: &RuntimeState, connections: &[SshConfig]) {
+    let client_counts = established_local_port_counts();
+    let now = Instant::now();
+
+    for config in connections {
+        if matches!(config.auth_profile, AuthProfile::Mfa)
+            || !matches!(config.start_mode, StartMode::OnDemand)
+            || matches!(config.tunnel_type, TunnelType::Remote)
+        {
+            continue;
+        }
+
+        if client_counts.get(&config.local_port).copied().unwrap_or(0) > 0 {
+            runtime
+                .last_activity
+                .lock()
+                .expect("runtime lock poisoned")
+                .insert(config.id.clone(), now);
+            continue;
+        }
+
+        let idle_for = runtime
+            .last_activity
+            .lock()
+            .expect("runtime lock poisoned")
+            .get(&config.id)
+            .map(|last_seen| now.duration_since(*last_seen))
+            .unwrap_or_default();
+
+        if idle_for.as_secs() >= config.idle_timeout_seconds {
+            stop_ssh_child(runtime, &config.id);
+        }
+    }
+}
+
+fn stop_ssh_child(runtime: &RuntimeState, id: &str) {
+    let child = runtime
+        .children
+        .lock()
+        .expect("runtime lock poisoned")
+        .remove(id);
+
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn reconcile_runtime(app: &AppHandle) {
+    let runtime = app.state::<RuntimeState>();
+    let connections = config::load_state().connections;
+    let by_id: HashMap<String, SshConfig> = connections
+        .iter()
+        .cloned()
+        .map(|config| (config.id.clone(), config))
+        .collect();
+    let desired = runtime
+        .desired
+        .lock()
+        .expect("runtime lock poisoned")
+        .clone();
+
+    for id in desired {
+        let Some(config) = by_id.get(&id) else {
+            continue;
+        };
+        if matches!(config.auth_profile, AuthProfile::Mfa)
+            || !config.auto_reconnect
+            || matches!(config.start_mode, StartMode::OnDemand)
+        {
+            continue;
+        }
+        if !child_is_running(&runtime, &config.id) {
+            let _ = start_ssh_child(&runtime, config, None);
+        }
+    }
+
+    apply_idle_policy(&runtime, &connections);
+}
+
+fn child_is_running(runtime: &RuntimeState, id: &str) -> bool {
+    let mut children = runtime.children.lock().expect("runtime lock poisoned");
+    if let Some(child) = children.get_mut(id) {
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) | Err(_) => {
+                children.remove(id);
+                false
+            }
+        }
+    } else {
+        false
     }
 }
 
@@ -650,6 +1034,14 @@ fn count_local_clients(local_ports: &HashSet<u16>) -> usize {
         return 0;
     }
 
+    established_local_port_counts()
+        .into_iter()
+        .filter(|(port, _)| local_ports.contains(port))
+        .map(|(_, count)| count)
+        .sum()
+}
+
+fn established_local_port_counts() -> HashMap<u16, usize> {
     let output = match Command::new("lsof")
         .arg("-nP")
         .arg("-iTCP")
@@ -657,14 +1049,17 @@ fn count_local_clients(local_ports: &HashSet<u16>) -> usize {
         .output()
     {
         Ok(output) if output.status.success() => output,
-        _ => return 0,
+        _ => return HashMap::new(),
     };
 
-    String::from_utf8_lossy(&output.stdout)
+    let mut counts = HashMap::new();
+    for port in String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(local_port_from_lsof_line)
-        .filter(|port| local_ports.contains(port))
-        .count()
+    {
+        *counts.entry(port).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn local_port_from_lsof_line(line: &str) -> Option<u16> {
@@ -868,6 +1263,7 @@ fn tray_status_icon(connected: bool) -> Image<'static> {
 }
 
 fn update_tray_status(app: &AppHandle) {
+    reconcile_runtime(app);
     let runtime = app.state::<RuntimeState>();
     let status = service_status_with_runtime(&runtime);
 
@@ -912,7 +1308,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
             MENU_HIDE => hide_main_window(app),
             MENU_START_SERVICE => {
                 let runtime = app.state::<RuntimeState>();
-                let report = start_service_with_runtime(&runtime);
+                let report = start_service_with_runtime(&runtime, Some(app.clone()));
                 emit_service_report(app, "started", report);
                 update_tray_status(app);
             }
@@ -1014,7 +1410,7 @@ fn start_tunnel(
     app: AppHandle,
 ) -> Result<ConnectionView, String> {
     let config = find_config(&id)?;
-    let view = start_config(&runtime, config)?;
+    let view = start_config(&runtime, config, Some(app.clone()))?;
     update_tray_status(&app);
     Ok(view)
 }
@@ -1028,7 +1424,7 @@ fn stop_tunnel(id: String, runtime: State<'_, RuntimeState>, app: AppHandle) -> 
 
 #[tauri::command]
 fn start_service(runtime: State<'_, RuntimeState>, app: AppHandle) -> ServiceReport {
-    let report = start_service_with_runtime(&runtime);
+    let report = start_service_with_runtime(&runtime, Some(app.clone()));
     update_tray_status(&app);
     report
 }
@@ -1090,6 +1486,11 @@ pub fn run() {
         .manage(RuntimeState {
             children: Mutex::new(HashMap::new()),
             traffic: Mutex::new(None),
+            desired: Mutex::new(HashSet::new()),
+            on_demand: Mutex::new(HashMap::new()),
+            upstream_ports: Mutex::new(HashMap::new()),
+            last_activity: Mutex::new(HashMap::new()),
+            needs_auth: Mutex::new(HashSet::new()),
         })
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -1149,6 +1550,10 @@ mod tests {
             local_port: 18080,
             remote_host: Some("127.0.0.1".to_string()),
             remote_port: Some(80),
+            auth_profile: AuthProfile::Normal,
+            start_mode: StartMode::Manual,
+            auto_reconnect: true,
+            idle_timeout_seconds: 600,
         }
     }
 
@@ -1178,6 +1583,39 @@ mod tests {
         dynamic.remote_host = None;
         dynamic.remote_port = None;
         assert!(validate_config(&dynamic).is_ok());
+    }
+
+    #[test]
+    fn normalizes_on_demand_policy_for_mfa_and_remote_tunnels() {
+        let base = ConnectionInput {
+            id: Some("test-id".to_string()),
+            name: "Test tunnel".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "me".to_string(),
+            auth_method: AuthMethod::Key,
+            password: None,
+            key_path: Some("/Users/me/.ssh/id_ed25519".to_string()),
+            key_passphrase: None,
+            tunnel_type: TunnelType::Local,
+            local_port: 18080,
+            remote_host: Some("127.0.0.1".to_string()),
+            remote_port: Some(80),
+            auth_profile: AuthProfile::Mfa,
+            start_mode: StartMode::OnDemand,
+            auto_reconnect: true,
+            idle_timeout_seconds: 10,
+        };
+
+        let mfa = to_config(base.clone());
+        assert_eq!(mfa.start_mode, StartMode::Always);
+        assert_eq!(mfa.idle_timeout_seconds, 30);
+
+        let mut remote = base;
+        remote.auth_profile = AuthProfile::Normal;
+        remote.tunnel_type = TunnelType::Remote;
+        let remote = to_config(remote);
+        assert_eq!(remote.start_mode, StartMode::Always);
     }
 
     #[test]
