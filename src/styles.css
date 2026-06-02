@@ -1065,7 +1065,7 @@ select:focus {
   display: flex;
   min-height: 0;
   flex-direction: column;
-  gap: 8px;
+  gap: 7px;
   overflow: auto;
 }
 
@@ -1086,16 +1086,23 @@ select:focus {
 
 .quick-row {
   display: grid;
-  gap: 10px;
+  min-height: 70px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
   border: 1px solid #dde4e1;
   border-radius: 8px;
   background: #ffffff;
-  padding: 10px;
+  padding: 10px 11px;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    box-shadow 150ms ease;
 }
 
 .quick-row.selected {
   border-color: #84b7ab;
-  box-shadow: 0 8px 18px rgb(16 24 23 / 8%);
+  box-shadow: 0 7px 16px rgb(16 24 23 / 7%);
 }
 
 .quick-row.running {
@@ -1112,7 +1119,7 @@ select:focus {
   gap: 10px;
   border-radius: 7px;
   background: transparent;
-  padding: 0;
+  padding: 2px 0;
   text-align: left;
 }
 
@@ -1142,14 +1149,7 @@ select:focus {
 .quick-row-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.quick-row-actions .status {
-  min-width: 68px;
-  padding: 3px 8px;
-  font-size: 11px;
+  justify-content: flex-end;
 }
 
 .quick-footer {

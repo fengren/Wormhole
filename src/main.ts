@@ -816,7 +816,6 @@ function renderOverview() {
         <span class="overview-logo brand-mark">${icon("route")}</span>
         <div>
           <h2>${escapeHtml(t("overview.title"))}</h2>
-          <p>${escapeHtml(t("overview.available", { running: serviceStatus.running, total: serviceStatus.total || connections.length }))}</p>
         </div>
       </div>
 
@@ -1051,7 +1050,6 @@ function renderSettings() {
 }
 
 function renderQuickPanel() {
-  const runningCount = connections.filter((connection) => connection.status === "running").length;
   const activeId = selectedId ?? connections[0]?.id ?? null;
 
   if (!app) return;
@@ -1060,7 +1058,6 @@ function renderQuickPanel() {
       <header class="quick-header">
         <div>
           <h1>${icon("route")} Wormhole</h1>
-          <p>${escapeHtml(t("quick.running", { running: serviceStatus.running || runningCount, total: serviceStatus.total || connections.length }))}</p>
         </div>
       </header>
 
@@ -1108,7 +1105,6 @@ function renderQuickRows() {
           </button>
           <div class="quick-row-actions">
             ${renderTunnelSwitch(connection)}
-            <span class="status ${connection.status}">${statusText(connection.status)}</span>
           </div>
         </article>
       `,
@@ -1251,7 +1247,6 @@ function render() {
           <button type="button" class="brand-button" data-action="overview">
             <span class="brand-mark">${icon("route")}</span>
             <h1>Wormhole</h1>
-            <span>${escapeHtml(t("app.subtitle"))}</span>
           </button>
         </div>
         <button type="button" class="new-button" data-action="new">${icon("plus")} ${escapeHtml(t("newTunnel"))}</button>

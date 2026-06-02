@@ -15,7 +15,7 @@ use tauri::{
     image::Image,
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, PhysicalPosition, RunEvent, State, WebviewUrl,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalRect, Rect, RunEvent, State, WebviewUrl,
     WebviewWindowBuilder, WindowEvent,
 };
 use uuid::Uuid;
@@ -29,6 +29,9 @@ const TRAY_ICON_SIZE: usize = 18;
 const QUICK_PANEL_LABEL: &str = "quick-panel";
 const QUICK_PANEL_WIDTH: f64 = 360.0;
 const QUICK_PANEL_HEIGHT: f64 = 480.0;
+const QUICK_PANEL_EDGE_GAP: f64 = 8.0;
+const QUICK_PANEL_TRAY_X_OFFSET: f64 = 18.0;
+const QUICK_PANEL_TRAY_Y_OFFSET: f64 = 12.0;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum TunnelStatus {
@@ -905,16 +908,84 @@ fn cleanup_ssh_processes(app: &AppHandle) {
     terminate_managed_children(&runtime);
 }
 
-fn toggle_quick_panel(app: &AppHandle, position: PhysicalPosition<f64>) {
-    let x = (position.x - QUICK_PANEL_WIDTH + 18.0).max(8.0);
-    let y = (position.y + 12.0).max(8.0);
+fn quick_panel_position(
+    click: PhysicalPosition<f64>,
+    work_area: Option<&PhysicalRect<i32, u32>>,
+) -> PhysicalPosition<f64> {
+    let (min_x, min_y, max_x, max_y) = if let Some(area) = work_area {
+        (
+            area.position.x as f64 + QUICK_PANEL_EDGE_GAP,
+            area.position.y as f64 + QUICK_PANEL_EDGE_GAP,
+            area.position.x as f64 + area.size.width as f64
+                - QUICK_PANEL_WIDTH
+                - QUICK_PANEL_EDGE_GAP,
+            area.position.y as f64 + area.size.height as f64
+                - QUICK_PANEL_HEIGHT
+                - QUICK_PANEL_EDGE_GAP,
+        )
+    } else {
+        (
+            QUICK_PANEL_EDGE_GAP,
+            QUICK_PANEL_EDGE_GAP,
+            f64::INFINITY,
+            f64::INFINITY,
+        )
+    };
+    let max_x = max_x.max(min_x);
+    let max_y = max_y.max(min_y);
+    let x = (click.x - QUICK_PANEL_WIDTH + QUICK_PANEL_TRAY_X_OFFSET).clamp(min_x, max_x);
+    let y = (click.y + QUICK_PANEL_TRAY_Y_OFFSET).clamp(min_y, max_y);
+
+    PhysicalPosition::new(x, y)
+}
+
+fn quick_panel_work_area(
+    app: &AppHandle,
+    click: PhysicalPosition<f64>,
+) -> Option<PhysicalRect<i32, u32>> {
+    let click_x = click.x.round() as i32;
+    let click_y = click.y.round() as i32;
+    app.available_monitors().ok().and_then(|monitors| {
+        monitors
+            .into_iter()
+            .find(|monitor| {
+                let area = monitor.work_area();
+                let right = area.position.x + area.size.width as i32;
+                let bottom = area.position.y + area.size.height as i32;
+                click_x >= area.position.x
+                    && click_x < right
+                    && click_y >= area.position.y
+                    && click_y < bottom
+            })
+            .map(|monitor| *monitor.work_area())
+    })
+}
+
+fn tray_anchor_position(position: PhysicalPosition<f64>, rect: Rect) -> PhysicalPosition<f64> {
+    let rect_position = rect.position.to_physical::<f64>(1.0);
+    let rect_size = rect.size.to_physical::<f64>(1.0);
+
+    if rect_size.width == 0.0 || rect_size.height == 0.0 {
+        return position;
+    }
+
+    PhysicalPosition::new(
+        rect_position.x + rect_size.width / 2.0,
+        rect_position.y + rect_size.height,
+    )
+}
+
+fn toggle_quick_panel(app: &AppHandle, position: PhysicalPosition<f64>, rect: Rect) {
+    let anchor = tray_anchor_position(position, rect);
+    let work_area = quick_panel_work_area(app, anchor);
+    let position = quick_panel_position(anchor, work_area.as_ref());
 
     if let Some(window) = app.get_webview_window(QUICK_PANEL_LABEL) {
         if window.is_visible().unwrap_or(false) {
             let _ = window.hide();
             return;
         }
-        let _ = window.set_position(PhysicalPosition::new(x, y));
+        let _ = window.set_position(position);
         let _ = window.show();
         let _ = window.set_focus();
         return;
@@ -927,7 +998,7 @@ fn toggle_quick_panel(app: &AppHandle, position: PhysicalPosition<f64>) {
     )
     .title("Wormhole Quick Panel")
     .inner_size(QUICK_PANEL_WIDTH, QUICK_PANEL_HEIGHT)
-    .position(x, y)
+    .position(position.x, position.y)
     .resizable(false)
     .decorations(false)
     .always_on_top(true)
@@ -1109,12 +1180,13 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
                 position,
+                rect,
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
             } = event
             {
-                toggle_quick_panel(tray.app_handle(), position);
+                toggle_quick_panel(tray.app_handle(), position, rect);
             }
         });
 
@@ -1333,6 +1405,20 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    fn work_area(x: i32, y: i32, width: u32, height: u32) -> PhysicalRect<i32, u32> {
+        PhysicalRect {
+            position: PhysicalPosition::new(x, y),
+            size: tauri::PhysicalSize::new(width, height),
+        }
+    }
+
+    fn tray_rect(x: f64, y: f64, width: u32, height: u32) -> Rect {
+        Rect {
+            position: PhysicalPosition::new(x, y).into(),
+            size: tauri::PhysicalSize::new(width, height).into(),
+        }
+    }
+
     fn base_config() -> SshConfig {
         SshConfig {
             id: "test-id".to_string(),
@@ -1387,6 +1473,40 @@ mod tests {
         let mut dynamic = base_config();
         dynamic.tunnel_type = TunnelType::Dynamic;
         assert_eq!(tunnel_arg(&dynamic), "18080");
+    }
+
+    #[test]
+    fn positions_quick_panel_on_clicked_monitor() {
+        let area = work_area(0, 0, 1440, 900);
+        let position = quick_panel_position(PhysicalPosition::new(1200.0, 24.0), Some(&area));
+
+        assert_eq!(position, PhysicalPosition::new(858.0, 36.0));
+    }
+
+    #[test]
+    fn positions_quick_panel_on_left_monitor_with_negative_coordinates() {
+        let area = work_area(-1920, 0, 1920, 1080);
+        let position = quick_panel_position(PhysicalPosition::new(-40.0, 24.0), Some(&area));
+
+        assert_eq!(position, PhysicalPosition::new(-382.0, 36.0));
+    }
+
+    #[test]
+    fn keeps_quick_panel_inside_clicked_monitor_work_area() {
+        let area = work_area(1440, 0, 1280, 720);
+        let position = quick_panel_position(PhysicalPosition::new(1500.0, 690.0), Some(&area));
+
+        assert_eq!(position, PhysicalPosition::new(1448.0, 232.0));
+    }
+
+    #[test]
+    fn anchors_quick_panel_to_tray_rect_when_available() {
+        let anchor = tray_anchor_position(
+            PhysicalPosition::new(100.0, 100.0),
+            tray_rect(-54.0, 0.0, 36, 24),
+        );
+
+        assert_eq!(anchor, PhysicalPosition::new(-36.0, 24.0));
     }
 
     #[test]
