@@ -53,12 +53,19 @@ type ConnectionInput = Omit<Connection, "id" | "status"> & {
   key_passphrase?: string;
 };
 
+type ServiceFailure = {
+  id: string;
+  name: string;
+  error: string;
+  kind: "host_key_mismatch" | "auth" | "other";
+};
+
 type ServiceReport = {
   total: number;
   running: number;
   started: number;
   clients: number;
-  failed: string[];
+  failed: ServiceFailure[];
 };
 
 type ServiceStatus = {
@@ -419,9 +426,10 @@ function icon(name: string, label = "") {
   return `<i class="icon" data-lucide="${name}" aria-hidden="${label ? "false" : "true"}" ${label ? `aria-label="${escapeHtml(label)}"` : ""}></i>`;
 }
 
-function hydrateIcons() {
+function hydrateIcons(root: Document | Element | DocumentFragment = document) {
   createIcons({
     icons: lucideIcons,
+    root,
     attrs: {
       "stroke-width": 2,
       "aria-hidden": "true",
@@ -443,11 +451,14 @@ function escapeHtml(value: unknown): string {
 }
 
 function connectionSummary(connection: Connection): string {
-  const destination =
-    connection.tunnel_type === "dynamic"
-      ? `SOCKS :${connection.local_port}`
-      : `${connection.remote_host}:${connection.remote_port}`;
-  return `${connection.username}@${connection.host}:${connection.port} -> ${destination}`;
+  if (connection.tunnel_type === "dynamic") {
+    return `SOCKS/HTTP 127.0.0.1:${connection.local_port}`;
+  }
+  if (connection.tunnel_type === "remote") {
+    const localTarget = `${connection.remote_host ?? "127.0.0.1"}:${connection.remote_port ?? ""}`;
+    return `${localTarget} <- ${connection.host}:${connection.local_port}`;
+  }
+  return `127.0.0.1:${connection.local_port} -> ${connection.remote_host}:${connection.remote_port}`;
 }
 
 function statusText(status: TunnelStatus): string {
@@ -524,7 +535,7 @@ function showMessage(
   if (target) {
     target.innerHTML = renderMessageContent();
     target.dataset.kind = kind;
-    hydrateIcons();
+    hydrateIcons(target);
   }
 }
 
@@ -547,7 +558,7 @@ function serviceMessage(action: "started" | "stopped", report: ServiceReport): s
     return t("message.withIssues", {
       action: action === "started" ? t("message.serviceStarted") : t("message.serviceStopped"),
       count: report.failed.length,
-      issues: report.failed.join("; "),
+      issues: report.failed.map((failure) => `${failure.name}: ${failure.error}`).join("; "),
     });
   }
   if (action === "started") {
@@ -561,6 +572,13 @@ function serviceMessage(action: "started" | "stopped", report: ServiceReport): s
     total: report.total,
     clients: report.clients,
   });
+}
+
+function serviceReportAction(report: ServiceReport): MessageAction | null {
+  const failure = report.failed.find((item) => item.kind === "host_key_mismatch");
+  return failure
+    ? { label: t("message.resetKnownHost"), action: "reset-known-host", id: failure.id }
+    : null;
 }
 
 function readInput(form: HTMLFormElement): ConnectionInput {
@@ -681,7 +699,7 @@ async function saveConnection(event: SubmitEvent) {
 
 async function startTunnel(id: string) {
   busyId = id;
-  render();
+  updateBusyTunnel(id);
   try {
     await invoke<Connection>("start_tunnel", { id });
     await loadConnections();
@@ -689,7 +707,7 @@ async function startTunnel(id: string) {
     showMessage(String(error), "error", hostKeyMismatchAction(error, id));
   } finally {
     busyId = null;
-    render();
+    updateBusyTunnel(id);
   }
 }
 
@@ -704,7 +722,7 @@ async function resetKnownHost(id: string) {
 
 async function stopTunnel(id: string) {
   busyId = id;
-  render();
+  updateBusyTunnel(id);
   try {
     await invoke("stop_tunnel", { id });
     showMessage(t("message.tunnelStopped"));
@@ -713,8 +731,17 @@ async function stopTunnel(id: string) {
     showMessage(String(error), "error");
   } finally {
     busyId = null;
-    render();
+    updateBusyTunnel(id);
   }
+}
+
+function updateBusyTunnel(id: string) {
+  const disabled = busyId === id;
+  document
+    .querySelectorAll<HTMLButtonElement>(`.tunnel-toggle[data-id="${CSS.escape(id)}"]`)
+    .forEach((button) => {
+      button.disabled = disabled;
+    });
 }
 
 async function toggleTunnel(id: string) {
@@ -1120,8 +1147,7 @@ function renderQuickPanel() {
     </main>
   `;
 
-  hydrateIcons();
-  bindRenderedControls();
+  hydrateIcons(app);
 }
 
 function renderQuickRows() {
@@ -1306,8 +1332,7 @@ function render() {
     </main>
   `;
 
-  hydrateIcons();
-  bindRenderedControls();
+  hydrateIcons(app);
 }
 
 async function handleAction(action: string, id: string | null, lang: string | null = null) {
@@ -1328,29 +1353,6 @@ async function handleAction(action: string, id: string | null, lang: string | nu
   if (action === "restart-app" && !isQuickPanel) await restartApp();
   if (action === "language" && (lang === "en" || lang === "zh")) setLanguage(lang);
   if (action === "reset-known-host" && id) await resetKnownHost(id);
-}
-
-function bindRenderedControls() {
-  if (!app) return;
-
-  app.querySelectorAll<HTMLButtonElement>(".tunnel-toggle").forEach((button) => {
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      if (button.disabled) return;
-      const id = button.dataset.id;
-      if (id) void toggleTunnel(id);
-    });
-  });
-
-  app.querySelectorAll<HTMLButtonElement>(".danger[data-action='delete']").forEach((button) => {
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      const id = button.dataset.id;
-      if (id) void deleteConnection(id);
-    });
-  });
 }
 
 function bindAppEvents() {
@@ -1409,6 +1411,7 @@ window.addEventListener("DOMContentLoaded", () => {
     showMessage(
       serviceMessage("started", event.payload),
       event.payload.failed.length ? "error" : "info",
+      serviceReportAction(event.payload),
     );
     await loadConnections();
   }).catch((error) => showMessage(String(error), "error"));
@@ -1416,6 +1419,7 @@ window.addEventListener("DOMContentLoaded", () => {
     showMessage(
       serviceMessage("stopped", event.payload),
       event.payload.failed.length ? "error" : "info",
+      serviceReportAction(event.payload),
     );
     await loadConnections();
   }).catch((error) => showMessage(String(error), "error"));

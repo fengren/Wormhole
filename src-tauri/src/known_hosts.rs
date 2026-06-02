@@ -1,7 +1,17 @@
 use crate::config::{self, SshConfig};
 use ssh2::{CheckResult, KnownHostFileKind, Session};
+use std::sync::{Mutex, OnceLock};
+
+static KNOWN_HOSTS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn known_hosts_lock() -> &'static Mutex<()> {
+    KNOWN_HOSTS_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 pub(crate) fn verify_known_host(session: &Session, config: &SshConfig) -> Result<(), String> {
+    let _guard = known_hosts_lock()
+        .lock()
+        .map_err(|_| "known_hosts lock poisoned".to_string())?;
     let Some((host_key, key_type)) = session.host_key() else {
         return Err("SSH server did not provide a host key.".into());
     };
@@ -35,6 +45,9 @@ pub(crate) fn verify_known_host(session: &Session, config: &SshConfig) -> Result
 }
 
 pub(crate) fn reset_known_host_for_config(config: &SshConfig) -> Result<bool, String> {
+    let _guard = known_hosts_lock()
+        .lock()
+        .map_err(|_| "known_hosts lock poisoned".to_string())?;
     let known_hosts_path = config::app_config_dir().join("known_hosts");
     if !known_hosts_path.exists() {
         return Ok(false);

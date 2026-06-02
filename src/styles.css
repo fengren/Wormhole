@@ -41,8 +41,7 @@ button {
 }
 
 button:disabled {
-  cursor: wait;
-  opacity: 0.62;
+  cursor: default;
 }
 
 .icon {
@@ -285,15 +284,13 @@ button:disabled {
   text-align: left;
   transition:
     border-color 150ms ease,
-    background-color 150ms ease,
-    box-shadow 150ms ease;
+    background-color 150ms ease;
 }
 
 .connection-row:hover,
 .connection-row.selected {
   border-color: #84b7ab;
   background: #fbfefd;
-  box-shadow: 0 8px 22px rgb(16 24 23 / 7%);
 }
 
 .connection-select {
@@ -384,6 +381,7 @@ button:disabled {
   transition:
     background-color 160ms ease,
     border-color 160ms ease;
+  will-change: background-color, border-color;
 }
 
 .toggle-thumb {
@@ -398,6 +396,7 @@ button:disabled {
     0 1px 2px rgb(16 24 23 / 20%),
     0 3px 8px rgb(16 24 23 / 14%);
   transition: transform 160ms ease;
+  will-change: transform;
 }
 
 .tunnel-toggle.is-on .toggle-track {
@@ -512,6 +511,17 @@ button:disabled {
   max-width: 1040px;
   flex-direction: column;
   gap: 18px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 1ms !important;
+  }
 }
 
 .overview-heading {
@@ -957,14 +967,12 @@ select:focus {
   padding: 11px;
   transition:
     background-color 150ms ease,
-    border-color 150ms ease,
-    box-shadow 150ms ease;
+    border-color 150ms ease;
 }
 
 .tunnel-help.active {
   border-color: #84b7ab;
   background: #f2fbf8;
-  box-shadow: 0 8px 20px rgb(16 24 23 / 7%);
 }
 
 .tunnel-help:hover {
@@ -1123,13 +1131,11 @@ select:focus {
   padding: 10px 11px;
   transition:
     background-color 150ms ease,
-    border-color 150ms ease,
-    box-shadow 150ms ease;
+    border-color 150ms ease;
 }
 
 .quick-row.selected {
   border-color: #84b7ab;
-  box-shadow: 0 7px 16px rgb(16 24 23 / 7%);
 }
 
 .quick-row.running {

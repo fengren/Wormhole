@@ -41,6 +41,7 @@ const QUICK_PANEL_HEIGHT: f64 = 480.0;
 const QUICK_PANEL_EDGE_GAP: f64 = 8.0;
 const QUICK_PANEL_TRAY_X_OFFSET: f64 = 18.0;
 const QUICK_PANEL_TRAY_Y_OFFSET: f64 = 12.0;
+const MAX_ACTIVE_CONNECTIONS: usize = 128;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum TunnelStatus {
@@ -104,14 +105,20 @@ struct SshConnection {
 }
 
 impl ActiveConnections {
-    fn track(&self, stream: &TcpStream) -> Option<u64> {
-        let tracked = stream.try_clone().ok()?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.streams
+    fn try_track(&self, stream: &TcpStream) -> Result<u64, String> {
+        let tracked = stream.try_clone().map_err(|err| err.to_string())?;
+        let mut streams = self
+            .streams
             .lock()
-            .expect("active connections lock poisoned")
-            .insert(id, tracked);
-        Some(id)
+            .expect("active connections lock poisoned");
+        if streams.len() >= MAX_ACTIVE_CONNECTIONS {
+            return Err(format!(
+                "Too many active tunnel connections. Limit is {MAX_ACTIVE_CONNECTIONS}."
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        streams.insert(id, tracked);
+        Ok(id)
     }
 
     fn untrack(&self, id: Option<u64>) {
@@ -187,7 +194,7 @@ struct ServiceReport {
     running: usize,
     started: usize,
     clients: usize,
-    failed: Vec<String>,
+    failed: Vec<ServiceFailure>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,6 +204,22 @@ struct ServiceStatus {
     clients: usize,
     traffic_bytes_per_second: u64,
     traffic_bytes_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ServiceFailureKind {
+    HostKeyMismatch,
+    Auth,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ServiceFailure {
+    id: String,
+    name: String,
+    error: String,
+    kind: ServiceFailureKind,
 }
 
 fn validate_config(config: &SshConfig) -> Result<(), String> {
@@ -494,15 +517,37 @@ fn start_config_preflight(runtime: &RuntimeState, config: &SshConfig) -> Result<
 }
 
 fn should_mark_needs_auth(config: &SshConfig, error: &str) -> bool {
-    if matches!(config.auth_profile, AuthProfile::Mfa) {
-        return true;
+    matches!(
+        service_failure_kind(config, error),
+        ServiceFailureKind::Auth
+    )
+}
+
+fn service_failure_kind(config: &SshConfig, error: &str) -> ServiceFailureKind {
+    let lowered = error.to_ascii_lowercase();
+    if lowered.contains("host key mismatch") {
+        return ServiceFailureKind::HostKeyMismatch;
     }
 
-    let error = error.to_ascii_lowercase();
-    error.contains("auth")
-        || error.contains("password")
-        || error.contains("passphrase")
-        || error.contains("publickey")
+    if lowered.contains("auth")
+        || lowered.contains("password")
+        || lowered.contains("passphrase")
+        || lowered.contains("publickey")
+        || (matches!(config.auth_profile, AuthProfile::Mfa) && lowered.contains("keyboard"))
+    {
+        return ServiceFailureKind::Auth;
+    }
+
+    ServiceFailureKind::Other
+}
+
+fn service_failure(config: &SshConfig, error: String) -> ServiceFailure {
+    ServiceFailure {
+        id: config.id.clone(),
+        name: config.name.clone(),
+        kind: service_failure_kind(config, &error),
+        error,
+    }
 }
 
 fn ensure_local_port_available(config: &SshConfig) -> Result<(), String> {
@@ -558,7 +603,7 @@ fn start_local_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
         .remote_port
         .ok_or_else(|| "Remote port is required for local tunnels.".to_string())?;
     let listener = bind_local_listener(config)?;
-    connect_ssh_session(config)?;
+    let initial_connection = Arc::new(Mutex::new(Some(connect_ssh_session(config)?)));
     let stop = Arc::new(AtomicBool::new(false));
     let bytes_total = Arc::new(AtomicU64::new(0));
     let active_connections = ActiveConnections::default();
@@ -569,11 +614,17 @@ fn start_local_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
         active_connections.clone(),
         config.clone(),
         move |client, config, bytes_total, stop| {
-            let connection = connect_ssh_session(&config)?;
-            let channel = connection
-                .session
-                .channel_direct_tcpip(&target_host, target_port, None)
-                .map_err(|err| err.to_string())?;
+            let (connection, from_initial) =
+                take_initial_ssh_connection(&initial_connection, &config)?;
+            let (connection, channel) = open_direct_channel(connection, &target_host, target_port)
+                .or_else(|error| {
+                    if from_initial {
+                        let connection = connect_ssh_session(&config)?;
+                        open_direct_channel(connection, &target_host, target_port)
+                    } else {
+                        Err(error)
+                    }
+                })?;
             connection.session.set_blocking(false);
             proxy_channel(client, channel, bytes_total, stop)?;
             Ok(())
@@ -592,7 +643,7 @@ fn start_local_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
 
 fn start_dynamic_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
     let listener = bind_local_listener(config)?;
-    connect_ssh_session(config)?;
+    let initial_connection = Arc::new(Mutex::new(Some(connect_ssh_session(config)?)));
     let stop = Arc::new(AtomicBool::new(false));
     let bytes_total = Arc::new(AtomicU64::new(0));
     let active_connections = ActiveConnections::default();
@@ -606,11 +657,17 @@ fn start_dynamic_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
             let Some(request) = read_proxy_request(&mut client)? else {
                 return Ok(());
             };
-            let connection = connect_ssh_session(&config)?;
-            let channel = connection
-                .session
-                .channel_direct_tcpip(&request.host, request.port, None)
-                .map_err(|err| err.to_string())?;
+            let (connection, from_initial) =
+                take_initial_ssh_connection(&initial_connection, &config)?;
+            let (connection, channel) =
+                open_direct_channel(connection, &request.host, request.port).or_else(|error| {
+                    if from_initial {
+                        let connection = connect_ssh_session(&config)?;
+                        open_direct_channel(connection, &request.host, request.port)
+                    } else {
+                        Err(error)
+                    }
+                })?;
             connection.session.set_blocking(false);
             write_proxy_success(&mut client, request.protocol)?;
             if !request.preface.is_empty() {
@@ -633,6 +690,33 @@ fn start_dynamic_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
         listener_port: Some(config.local_port),
         thread: Some(thread),
     })
+}
+
+fn take_initial_ssh_connection(
+    initial_connection: &Arc<Mutex<Option<SshConnection>>>,
+    config: &SshConfig,
+) -> Result<(SshConnection, bool), String> {
+    if let Some(connection) = initial_connection
+        .lock()
+        .map_err(|_| "initial SSH connection lock poisoned".to_string())?
+        .take()
+    {
+        return Ok((connection, true));
+    }
+
+    connect_ssh_session(config).map(|connection| (connection, false))
+}
+
+fn open_direct_channel(
+    connection: SshConnection,
+    host: &str,
+    port: u16,
+) -> Result<(SshConnection, Channel), String> {
+    let channel = connection
+        .session
+        .channel_direct_tcpip(host, port, None)
+        .map_err(|err| err.to_string())?;
+    Ok((connection, channel))
 }
 
 fn start_remote_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
@@ -666,12 +750,21 @@ fn start_remote_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
                         let bytes = bytes_for_thread.clone();
                         let stop = stop_for_thread.clone();
                         let active = active_for_thread.clone();
-                        let id = active.track(&local);
+                        let id = match active.try_track(&local) {
+                            Ok(id) => id,
+                            Err(error) => {
+                                log::warn!("Remote tunnel rejected client: {error}");
+                                let _ = local.shutdown(Shutdown::Both);
+                                let mut channel = channel;
+                                let _ = channel.close();
+                                continue;
+                            }
+                        };
                         thread::spawn(move || {
                             if let Err(error) = proxy_channel(local, channel, bytes, stop) {
                                 log::warn!("Remote tunnel proxy ended with error: {error}");
                             }
-                            active.untrack(id);
+                            active.untrack(Some(id));
                         });
                     }
                     Err(_) => {
@@ -745,13 +838,20 @@ where
                     let bytes_total = bytes_total.clone();
                     let stop_for_client = stop.clone();
                     let active = active_connections.clone();
-                    let id = active.track(&client);
+                    let id = match active.try_track(&client) {
+                        Ok(id) => id,
+                        Err(error) => {
+                            log::warn!("Tunnel rejected client: {error}");
+                            let _ = client.shutdown(Shutdown::Both);
+                            continue;
+                        }
+                    };
                     let handler = handler.clone();
                     thread::spawn(move || {
                         if let Err(error) = handler(client, config, bytes_total, stop_for_client) {
                             log::warn!("Tunnel client handler ended with error: {error}");
                         }
-                        active.untrack(id);
+                        active.untrack(Some(id));
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1128,14 +1228,13 @@ fn start_service_with_runtime(runtime: &RuntimeState) -> ServiceReport {
     let mut failed = Vec::new();
 
     for config in connections {
-        let name = config.name.clone();
-        match start_config(runtime, config) {
+        match start_config(runtime, config.clone()) {
             Ok(view) => {
                 if matches!(view.status, TunnelStatus::Running) {
                     started += 1;
                 }
             }
-            Err(error) => failed.push(format!("{name}: {error}")),
+            Err(error) => failed.push(service_failure(&config, error)),
         }
     }
 
@@ -1164,16 +1263,25 @@ fn stop_service_with_runtime(runtime: &RuntimeState) -> ServiceReport {
     let mut stopped_ids = HashSet::new();
 
     for config in connections {
-        let name = config.name.clone();
         if let Err(error) = stop_tunnel_by_id(runtime, &config.id) {
-            failed.push(format!("{name}: {error}"));
+            failed.push(ServiceFailure {
+                id: config.id.clone(),
+                name: config.name.clone(),
+                error,
+                kind: ServiceFailureKind::Other,
+            });
         }
         stopped_ids.insert(config.id);
     }
 
     for id in tunnel_ids.difference(&stopped_ids) {
         if let Err(error) = stop_tunnel_by_id(runtime, &id) {
-            failed.push(format!("{id}: {error}"));
+            failed.push(ServiceFailure {
+                id: id.clone(),
+                name: id.clone(),
+                error,
+                kind: ServiceFailureKind::Other,
+            });
         }
     }
 
@@ -1561,7 +1669,7 @@ fn update_tray_status(app: &AppHandle) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_icon(Some(tray_status_icon(status.running > 0)));
         let _ = tray.set_icon_as_template(false);
-        let _ = tray.set_title(Some(status.clients.to_string()));
+        let _ = tray.set_title(Option::<&str>::None);
         let _ = tray.set_tooltip(Some(format!(
             "Wormhole · {} client(s), {} tunnel(s) running",
             status.clients, status.running
@@ -1971,7 +2079,7 @@ mod tests {
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         let active_connections = ActiveConnections::default();
-        active_connections.track(&server);
+        active_connections.try_track(&server).unwrap();
         let handle = TunnelHandle {
             stop: Arc::new(AtomicBool::new(false)),
             bytes_total: Arc::new(AtomicU64::new(0)),
@@ -2129,7 +2237,7 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         let active_connections = ActiveConnections::default();
-        active_connections.track(&server);
+        active_connections.try_track(&server).unwrap();
         let runtime = RuntimeState {
             tunnels: Mutex::new(HashMap::from([(
                 "test-id".to_string(),
@@ -2149,5 +2257,47 @@ mod tests {
 
         assert_eq!(active_tunnel_connection_count(&runtime), 1);
         drop(client);
+    }
+
+    #[test]
+    fn rejects_clients_when_active_connection_limit_is_reached() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let active_connections = ActiveConnections::default();
+        {
+            let mut streams = active_connections
+                .streams
+                .lock()
+                .expect("active connections lock poisoned");
+            for id in 0..MAX_ACTIVE_CONNECTIONS as u64 {
+                streams.insert(id, server.try_clone().unwrap());
+            }
+        }
+
+        assert!(active_connections.try_track(&server).is_err());
+        drop(client);
+    }
+
+    #[test]
+    fn classifies_host_key_mismatch_failures() {
+        assert_eq!(
+            service_failure_kind(
+                &base_config(),
+                "SSH host key mismatch in Wormhole known_hosts"
+            ),
+            ServiceFailureKind::HostKeyMismatch
+        );
+    }
+
+    #[test]
+    fn does_not_classify_all_mfa_failures_as_auth_failures() {
+        let mut config = base_config();
+        config.auth_profile = AuthProfile::Mfa;
+
+        assert_eq!(
+            service_failure_kind(&config, "Local port 18080 is already in use"),
+            ServiceFailureKind::Other
+        );
     }
 }
