@@ -306,7 +306,7 @@ const translations: Record<Language, Record<I18nKey, string>> = {
   },
   zh: {
     "app.subtitle": "SSH 隧道",
-    newTunnel: "新增隧道",
+    newTunnel: "新建",
     noTunnels: "还没有隧道。",
     settings: "设置",
     "overview.title": "服务概览",
@@ -325,8 +325,8 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "status.exited": "已退出",
     "status.needsAuth": "需要认证",
     "status.needsAttention": "需要处理",
-    "form.editTitle": "编辑隧道",
-    "form.newTitle": "新增隧道",
+    "form.editTitle": "编辑",
+    "form.newTitle": "新建",
     "form.createHint": "创建一条 SSH 转发规则。",
     "form.name": "名称",
     "form.sshHost": "SSH 主机",
@@ -637,7 +637,7 @@ async function saveConnection(event: SubmitEvent) {
     const saved = await invoke<Connection>("save_connection", { input });
     selectedId = saved.id;
     viewMode = "edit";
-    showMessage(t("message.saved"));
+    showMessage("");
     await loadConnections();
   } catch (error) {
     showMessage(String(error), "error");

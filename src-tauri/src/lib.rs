@@ -1141,7 +1141,7 @@ fn list_connections(runtime: State<'_, RuntimeState>) -> Vec<ConnectionView> {
 }
 
 #[tauri::command]
-fn save_connection(input: ConnectionInput) -> Result<ConnectionView, String> {
+fn save_connection(input: ConnectionInput, app: AppHandle) -> Result<ConnectionView, String> {
     let config = to_config(input.clone());
     validate_config(&config)?;
 
@@ -1167,6 +1167,7 @@ fn save_connection(input: ConnectionInput) -> Result<ConnectionView, String> {
         state.connections.push(config.clone());
     }
     config::save_state(&state).map_err(|err| err.to_string())?;
+    update_tray_status(&app);
 
     Ok(ConnectionView {
         config,
