@@ -229,13 +229,9 @@ type I18nKey =
   | "settings.updatesHint"
   | "update.check"
   | "update.checking"
-  | "update.available"
-  | "update.notAvailable"
   | "update.downloading"
   | "update.downloadingUnknown"
-  | "update.installed"
-  | "update.restart"
-  | "update.failed";
+  | "update.restart";
 
 const translations: Record<Language, Record<I18nKey, string>> = {
   en: {
@@ -316,13 +312,9 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "settings.updatesHint": "Check GitHub Releases for a signed Wormhole update.",
     "update.check": "Check updates",
     "update.checking": "Checking for updates...",
-    "update.available": "Version {version} is available. Downloading...",
-    "update.notAvailable": "Wormhole is up to date.",
     "update.downloading": "Downloading update: {progress}%",
     "update.downloadingUnknown": "Downloading update...",
-    "update.installed": "Update installed. Restart Wormhole to apply it.",
     "update.restart": "Restart",
-    "update.failed": "Update failed: {error}",
   },
   zh: {
     "app.subtitle": "SSH 隧道",
@@ -402,13 +394,9 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "settings.updatesHint": "从 GitHub Releases 检查签名更新包。",
     "update.check": "检查更新",
     "update.checking": "正在检查更新...",
-    "update.available": "发现版本 {version}，正在下载...",
-    "update.notAvailable": "Wormhole 已是最新版本。",
     "update.downloading": "正在下载更新：{progress}%",
     "update.downloadingUnknown": "正在下载更新...",
-    "update.installed": "更新已安装，重启 Wormhole 后生效。",
     "update.restart": "重启",
-    "update.failed": "更新失败：{error}",
   },
 };
 
@@ -455,8 +443,7 @@ function connectionSummary(connection: Connection): string {
     return `SOCKS/HTTP 127.0.0.1:${connection.local_port}`;
   }
   if (connection.tunnel_type === "remote") {
-    const localTarget = `${connection.remote_host ?? "127.0.0.1"}:${connection.remote_port ?? ""}`;
-    return `${localTarget} <- ${connection.host}:${connection.local_port}`;
+    return `${connection.remote_host ?? "127.0.0.1"}:${connection.remote_port ?? ""}`;
   }
   return `127.0.0.1:${connection.local_port} -> ${connection.remote_host}:${connection.remote_port}`;
 }
@@ -809,17 +796,14 @@ async function checkForUpdates() {
   updateState = "checking";
   updateProgress = 0;
   render();
-  showMessage(t("update.checking"));
 
   try {
     const update = await check();
     if (!update) {
-      showMessage(t("update.notAvailable"));
       updateState = "idle";
       return;
     }
 
-    showMessage(t("update.available", { version: update.version }));
     let downloaded = 0;
     let total = 0;
     await update.downloadAndInstall((event) => {
@@ -839,11 +823,10 @@ async function checkForUpdates() {
     });
     updateState = "installed";
     updateProgress = 100;
-    showMessage(t("update.installed"));
   } catch (error) {
     updateState = "idle";
     updateProgress = 0;
-    showMessage(t("update.failed", { error: String(error) }), "error");
+    console.error("Update failed", error);
   } finally {
     render();
   }

@@ -1669,7 +1669,7 @@ fn update_tray_status(app: &AppHandle) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_icon(Some(tray_status_icon(status.running > 0)));
         let _ = tray.set_icon_as_template(false);
-        let _ = tray.set_title(Option::<&str>::None);
+        let _ = tray.set_title(Some(status.clients.to_string()));
         let _ = tray.set_tooltip(Some(format!(
             "Wormhole · {} client(s), {} tunnel(s) running",
             status.clients, status.running
