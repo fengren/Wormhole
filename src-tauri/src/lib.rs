@@ -1,14 +1,23 @@
 mod config;
 mod keychain;
+mod known_hosts;
 
 use config::{AuthMethod, AuthProfile, SshConfig, TunnelType};
+use known_hosts::{reset_known_host_for_config, verify_known_host};
 use serde::{Deserialize, Serialize};
+use ssh2::{Channel, Session};
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
-    process::{Child, Command, Stdio},
-    sync::Mutex,
+    io::{self, Read, Write},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
+    path::Path,
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 use tauri::{
@@ -68,10 +77,102 @@ struct ConnectionInput {
 }
 
 struct RuntimeState {
-    children: Mutex<HashMap<String, Child>>,
+    tunnels: Mutex<HashMap<String, TunnelHandle>>,
     traffic: Mutex<Option<TrafficSnapshot>>,
     desired: Mutex<HashSet<String>>,
     needs_auth: Mutex<HashSet<String>>,
+}
+
+struct TunnelHandle {
+    stop: Arc<AtomicBool>,
+    bytes_total: Arc<AtomicU64>,
+    active_connections: ActiveConnections,
+    ssh_shutdown: Option<TcpStream>,
+    listener_port: Option<u16>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Default)]
+struct ActiveConnections {
+    next_id: Arc<AtomicU64>,
+    streams: Arc<Mutex<HashMap<u64, TcpStream>>>,
+}
+
+struct SshConnection {
+    session: Session,
+    shutdown: TcpStream,
+}
+
+impl ActiveConnections {
+    fn track(&self, stream: &TcpStream) -> Option<u64> {
+        let tracked = stream.try_clone().ok()?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.streams
+            .lock()
+            .expect("active connections lock poisoned")
+            .insert(id, tracked);
+        Some(id)
+    }
+
+    fn untrack(&self, id: Option<u64>) {
+        if let Some(id) = id {
+            self.streams
+                .lock()
+                .expect("active connections lock poisoned")
+                .remove(&id);
+        }
+    }
+
+    fn shutdown_all(&self) {
+        let streams: Vec<TcpStream> = self
+            .streams
+            .lock()
+            .expect("active connections lock poisoned")
+            .values()
+            .filter_map(|stream| stream.try_clone().ok())
+            .collect();
+
+        for stream in streams {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.streams
+            .lock()
+            .expect("active connections lock poisoned")
+            .len()
+    }
+}
+
+impl TunnelHandle {
+    fn is_running(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.active_connections.shutdown_all();
+        if let Some(stream) = &self.ssh_shutdown {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        if let Some(port) = self.listener_port {
+            let _ = TcpStream::connect(("127.0.0.1", port));
+        }
+    }
+
+    fn join(mut self) {
+        self.stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    fn active_count(&self) -> usize {
+        self.active_connections.len()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,22 +261,22 @@ fn to_config(input: ConnectionInput) -> SshConfig {
 }
 
 fn mark_status(runtime: &RuntimeState, id: &str) -> TunnelStatus {
-    let mut children = runtime.children.lock().expect("runtime lock poisoned");
-    if let Some(child) = children.get_mut(id) {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                children.remove(id);
-                TunnelStatus::Exited
+    let stopped = {
+        let mut tunnels = runtime.tunnels.lock().expect("runtime lock poisoned");
+        if let Some(tunnel) = tunnels.get(id) {
+            if tunnel.is_running() {
+                return TunnelStatus::Running;
             }
-            Ok(None) => TunnelStatus::Running,
-            Err(_) => {
-                children.remove(id);
-                TunnelStatus::Exited
-            }
+            tunnels.remove(id)
+        } else {
+            return TunnelStatus::Stopped;
         }
-    } else {
-        TunnelStatus::Stopped
+    };
+
+    if let Some(tunnel) = stopped {
+        tunnel.join();
     }
+    TunnelStatus::Exited
 }
 
 fn find_config(id: &str) -> Result<SshConfig, String> {
@@ -186,22 +287,22 @@ fn find_config(id: &str) -> Result<SshConfig, String> {
         .ok_or_else(|| "Connection not found.".to_string())
 }
 
-fn connection_view(
-    runtime: &RuntimeState,
-    config: SshConfig,
-    listening_ports: &HashSet<u16>,
-) -> ConnectionView {
-    let status = tunnel_status(runtime, &config, listening_ports);
+fn connection_view(runtime: &RuntimeState, config: SshConfig) -> ConnectionView {
+    let status = tunnel_status(runtime, &config);
     ConnectionView { config, status }
 }
 
-fn tunnel_status(
-    runtime: &RuntimeState,
-    config: &SshConfig,
-    listening_ports: &HashSet<u16>,
-) -> TunnelStatus {
+fn tunnel_status(runtime: &RuntimeState, config: &SshConfig) -> TunnelStatus {
     match mark_status(runtime, &config.id) {
         TunnelStatus::Running => TunnelStatus::Running,
+        _ if runtime
+            .needs_auth
+            .lock()
+            .expect("runtime lock poisoned")
+            .contains(&config.id) =>
+        {
+            TunnelStatus::NeedsAuth
+        }
         TunnelStatus::Exited if matches!(config.auth_profile, AuthProfile::Mfa) => {
             runtime
                 .needs_auth
@@ -210,142 +311,104 @@ fn tunnel_status(
                 .insert(config.id.clone());
             TunnelStatus::NeedsAuth
         }
-        _ if matches!(config.auth_profile, AuthProfile::Mfa)
-            && runtime
-                .needs_auth
-                .lock()
-                .expect("runtime lock poisoned")
-                .contains(&config.id) =>
-        {
-            TunnelStatus::NeedsAuth
-        }
-        _ if !matches!(config.tunnel_type, TunnelType::Remote)
-            && listening_ports.contains(&config.local_port) =>
-        {
-            TunnelStatus::Running
-        }
         status => status,
     }
 }
 
 fn active_tunnel_ids(runtime: &RuntimeState) -> HashSet<String> {
-    let mut children = runtime.children.lock().expect("runtime lock poisoned");
-    let mut inactive = Vec::new();
+    let inactive = {
+        let mut tunnels = runtime.tunnels.lock().expect("runtime lock poisoned");
+        let inactive_ids: Vec<String> = tunnels
+            .iter()
+            .filter(|(_, tunnel)| !tunnel.is_running())
+            .map(|(id, _)| id.clone())
+            .collect();
 
-    for (id, child) in children.iter_mut() {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => inactive.push(id.clone()),
-            Ok(None) => {}
+        let mut inactive = Vec::new();
+        for id in inactive_ids {
+            if let Some(tunnel) = tunnels.remove(&id) {
+                inactive.push(tunnel);
+            }
         }
+        inactive
+    };
+
+    for tunnel in inactive {
+        tunnel.join();
     }
 
-    for id in inactive {
-        children.remove(&id);
-    }
-
-    children.keys().cloned().collect()
+    runtime
+        .tunnels
+        .lock()
+        .expect("runtime lock poisoned")
+        .keys()
+        .cloned()
+        .collect()
 }
 
-fn askpass_path() -> Result<std::path::PathBuf, String> {
-    let path = config::app_config_dir().join("askpass.sh");
-    let script = "#!/bin/sh\nprintf '%s\\n' \"$WORMHOLE_ASKPASS_PASSWORD\"\n";
-    fs::write(&path, script).map_err(|err| err.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .map_err(|err| err.to_string())?;
-    }
-    Ok(path)
+fn tunnel_bind_addr(config: &SshConfig) -> (&'static str, u16) {
+    ("127.0.0.1", config.local_port)
 }
 
-fn tunnel_arg(config: &SshConfig) -> String {
-    match config.tunnel_type {
-        TunnelType::Local => format!(
-            "{}:{}:{}",
-            config.local_port,
-            config.remote_host.as_deref().unwrap_or("127.0.0.1"),
-            config.remote_port.unwrap_or(0)
-        ),
-        TunnelType::Remote => format!(
-            "{}:{}:{}",
-            config.local_port,
-            config.remote_host.as_deref().unwrap_or("127.0.0.1"),
-            config.remote_port.unwrap_or(0)
-        ),
-        TunnelType::Dynamic => config.local_port.to_string(),
-    }
+fn connect_ssh_session(config: &SshConfig) -> Result<SshConnection, String> {
+    let address = resolve_ssh_address(config)?;
+    let tcp = TcpStream::connect_timeout(&address, Duration::from_secs(12))
+        .map_err(|err| format!("Could not connect to SSH host: {err}"))?;
+    let shutdown = tcp.try_clone().map_err(|err| err.to_string())?;
+    tcp.set_nodelay(true).ok();
+    tcp.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
+
+    let mut session = Session::new().map_err(|err| err.to_string())?;
+    session.set_timeout(30_000);
+    session.set_tcp_stream(tcp);
+    session.handshake().map_err(|err| err.to_string())?;
+    verify_known_host(&session, config)?;
+    authenticate_session(&session, config)?;
+    session.set_keepalive(true, 30);
+    Ok(SshConnection { session, shutdown })
 }
 
-fn spawn_ssh(config: &SshConfig) -> Result<Child, String> {
-    let mut command = Command::new("ssh");
-    command
-        .arg("-N")
-        .arg("-T")
-        .arg("-p")
-        .arg(config.port.to_string())
-        .arg("-o")
-        .arg("ExitOnForwardFailure=yes")
-        .arg("-o")
-        .arg("ServerAliveInterval=30")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3")
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new");
+fn resolve_ssh_address(config: &SshConfig) -> Result<SocketAddr, String> {
+    (config.host.as_str(), config.port)
+        .to_socket_addrs()
+        .map_err(|err| err.to_string())?
+        .next()
+        .ok_or_else(|| "Could not resolve SSH host.".to_string())
+}
 
-    match config.tunnel_type {
-        TunnelType::Local => {
-            command.arg("-L").arg(tunnel_arg(config));
-        }
-        TunnelType::Remote => {
-            command.arg("-R").arg(tunnel_arg(config));
-        }
-        TunnelType::Dynamic => {
-            command.arg("-D").arg(tunnel_arg(config));
-        }
-    }
-
+fn authenticate_session(session: &Session, config: &SshConfig) -> Result<(), String> {
     match config.auth_method {
-        AuthMethod::Key => {
-            if let Some(path) = &config.key_path {
-                command.arg("-i").arg(path);
-            }
-            if let Ok(passphrase) = keychain::get_key_passphrase(&config.id) {
-                let askpass = askpass_path()?;
-                command
-                    .env("SSH_ASKPASS", askpass)
-                    .env("SSH_ASKPASS_REQUIRE", "force")
-                    .env("DISPLAY", "wormhole")
-                    .env("WORMHOLE_ASKPASS_PASSWORD", passphrase);
-            }
-        }
         AuthMethod::Password => {
             let password = keychain::get_password(&config.id)
                 .map_err(|_| "Password is missing. Save the connection with a password first.")?;
-            let askpass = askpass_path()?;
-            command
-                .env("SSH_ASKPASS", askpass)
-                .env("SSH_ASKPASS_REQUIRE", "force")
-                .env("DISPLAY", "wormhole")
-                .env("WORMHOLE_ASKPASS_PASSWORD", password);
+            session
+                .userauth_password(&config.username, &password)
+                .map_err(|err| err.to_string())?;
+        }
+        AuthMethod::Key => {
+            let key_path = config
+                .key_path
+                .as_deref()
+                .ok_or_else(|| "Key path is required for key authentication.".to_string())?;
+            let passphrase = keychain::get_key_passphrase(&config.id).ok();
+            if let Err(key_error) = session.userauth_pubkey_file(
+                &config.username,
+                None,
+                Path::new(key_path),
+                passphrase.as_deref(),
+            ) {
+                session.userauth_agent(&config.username).map_err(|agent_error| {
+                    format!("SSH key authentication failed: {key_error}; agent fallback failed: {agent_error}")
+                })?;
+            }
         }
     }
 
-    command
-        .arg(format!("{}@{}", config.username, config.host))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| {
-            if err.kind() == io::ErrorKind::NotFound {
-                "Could not find the ssh command on this Mac.".to_string()
-            } else {
-                err.to_string()
-            }
-        })
+    session
+        .authenticated()
+        .then_some(())
+        .ok_or_else(|| "SSH authentication failed.".to_string())
 }
 
 fn start_config(runtime: &RuntimeState, config: SshConfig) -> Result<ConnectionView, String> {
@@ -357,35 +420,47 @@ fn start_config(runtime: &RuntimeState, config: SshConfig) -> Result<ConnectionV
         .expect("runtime lock poisoned")
         .insert(config.id.clone());
 
-    {
-        let mut children = runtime.children.lock().expect("runtime lock poisoned");
-        if let Some(child) = children.get_mut(&config.id) {
-            if child.try_wait().map_err(|err| err.to_string())?.is_none() {
+    let stopped = {
+        let mut tunnels = runtime.tunnels.lock().expect("runtime lock poisoned");
+        if let Some(tunnel) = tunnels.get(&config.id) {
+            if tunnel.is_running() {
                 return Ok(ConnectionView {
                     config,
                     status: TunnelStatus::Running,
                 });
             }
-            children.remove(&config.id);
+            tunnels.remove(&config.id)
+        } else {
+            None
         }
+    };
+    if let Some(tunnel) = stopped {
+        tunnel.join();
     }
 
-    if !matches!(config.tunnel_type, TunnelType::Remote) {
-        let ports = HashSet::from([config.local_port]);
-        if listening_local_ports(&ports).contains(&config.local_port) {
-            return Err(format!(
-                "Local port {} is already in use.",
-                config.local_port
-            ));
-        }
-    }
+    ensure_local_port_available(&config)?;
 
-    start_ssh_child(runtime, &config).inspect_err(|_| {
+    start_ssh_tunnel(runtime, &config).inspect_err(|error| {
+        log::error!(
+            "Failed to start tunnel '{}' ({}@{}:{}): {}",
+            config.name,
+            config.username,
+            config.host,
+            config.port,
+            error
+        );
         runtime
             .desired
             .lock()
             .expect("runtime lock poisoned")
             .remove(&config.id);
+        if should_mark_needs_auth(&config, error) {
+            runtime
+                .needs_auth
+                .lock()
+                .expect("runtime lock poisoned")
+                .insert(config.id.clone());
+        }
     })?;
 
     Ok(ConnectionView {
@@ -398,52 +473,627 @@ fn start_config(runtime: &RuntimeState, config: SshConfig) -> Result<ConnectionV
 fn start_config_preflight(runtime: &RuntimeState, config: &SshConfig) -> Result<(), String> {
     validate_config(config)?;
 
-    {
-        let mut children = runtime.children.lock().expect("runtime lock poisoned");
-        if let Some(child) = children.get_mut(&config.id) {
-            if child.try_wait().map_err(|err| err.to_string())?.is_none() {
+    let stopped = {
+        let mut tunnels = runtime.tunnels.lock().expect("runtime lock poisoned");
+        if let Some(tunnel) = tunnels.get(&config.id) {
+            if tunnel.is_running() {
                 return Ok(());
             }
-            children.remove(&config.id);
+            tunnels.remove(&config.id)
+        } else {
+            None
         }
+    };
+    if let Some(tunnel) = stopped {
+        tunnel.join();
     }
 
-    if !matches!(config.tunnel_type, TunnelType::Remote) {
-        let ports = HashSet::from([config.local_port]);
-        if listening_local_ports(&ports).contains(&config.local_port) {
-            return Err(format!(
-                "Local port {} is already in use.",
-                config.local_port
-            ));
-        }
-    }
+    ensure_local_port_available(config)?;
 
     Ok(())
 }
 
-fn start_ssh_child(runtime: &RuntimeState, config: &SshConfig) -> Result<(), String> {
-    {
-        let mut children = runtime.children.lock().expect("runtime lock poisoned");
-        if let Some(child) = children.get_mut(&config.id) {
-            if child.try_wait().map_err(|err| err.to_string())?.is_none() {
-                return Ok(());
-            }
-            children.remove(&config.id);
-        }
+fn should_mark_needs_auth(config: &SshConfig, error: &str) -> bool {
+    if matches!(config.auth_profile, AuthProfile::Mfa) {
+        return true;
     }
 
-    let child = spawn_ssh(config)?;
+    let error = error.to_ascii_lowercase();
+    error.contains("auth")
+        || error.contains("password")
+        || error.contains("passphrase")
+        || error.contains("publickey")
+}
+
+fn ensure_local_port_available(config: &SshConfig) -> Result<(), String> {
+    if matches!(config.tunnel_type, TunnelType::Remote) {
+        return Ok(());
+    }
+
+    TcpListener::bind(tunnel_bind_addr(config))
+        .map(|_| ())
+        .map_err(|err| format!("Local port {} is already in use: {err}", config.local_port))
+}
+
+fn start_ssh_tunnel(runtime: &RuntimeState, config: &SshConfig) -> Result<(), String> {
+    let stopped = {
+        let mut tunnels = runtime.tunnels.lock().expect("runtime lock poisoned");
+        if let Some(tunnel) = tunnels.get(&config.id) {
+            if tunnel.is_running() {
+                return Ok(());
+            }
+            tunnels.remove(&config.id)
+        } else {
+            None
+        }
+    };
+    if let Some(tunnel) = stopped {
+        tunnel.join();
+    }
+
+    let handle = match config.tunnel_type {
+        TunnelType::Local => start_local_tunnel(config)?,
+        TunnelType::Dynamic => start_dynamic_tunnel(config)?,
+        TunnelType::Remote => start_remote_tunnel(config)?,
+    };
     runtime
-        .children
+        .tunnels
         .lock()
         .expect("runtime lock poisoned")
-        .insert(config.id.clone(), child);
+        .insert(config.id.clone(), handle);
     runtime
         .needs_auth
         .lock()
         .expect("runtime lock poisoned")
         .remove(&config.id);
     Ok(())
+}
+
+fn start_local_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
+    let target_host = config
+        .remote_host
+        .clone()
+        .ok_or_else(|| "Remote host is required for local tunnels.".to_string())?;
+    let target_port = config
+        .remote_port
+        .ok_or_else(|| "Remote port is required for local tunnels.".to_string())?;
+    let listener = bind_local_listener(config)?;
+    connect_ssh_session(config)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let bytes_total = Arc::new(AtomicU64::new(0));
+    let active_connections = ActiveConnections::default();
+    let thread = spawn_listener_thread(
+        listener,
+        stop.clone(),
+        bytes_total.clone(),
+        active_connections.clone(),
+        config.clone(),
+        move |client, config, bytes_total, stop| {
+            let connection = connect_ssh_session(&config)?;
+            let channel = connection
+                .session
+                .channel_direct_tcpip(&target_host, target_port, None)
+                .map_err(|err| err.to_string())?;
+            connection.session.set_blocking(false);
+            proxy_channel(client, channel, bytes_total, stop)?;
+            Ok(())
+        },
+    );
+
+    Ok(TunnelHandle {
+        stop,
+        bytes_total,
+        active_connections,
+        ssh_shutdown: None,
+        listener_port: Some(config.local_port),
+        thread: Some(thread),
+    })
+}
+
+fn start_dynamic_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
+    let listener = bind_local_listener(config)?;
+    connect_ssh_session(config)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let bytes_total = Arc::new(AtomicU64::new(0));
+    let active_connections = ActiveConnections::default();
+    let thread = spawn_listener_thread(
+        listener,
+        stop.clone(),
+        bytes_total.clone(),
+        active_connections.clone(),
+        config.clone(),
+        move |mut client, config, bytes_total, stop| {
+            let Some(request) = read_proxy_request(&mut client)? else {
+                return Ok(());
+            };
+            let connection = connect_ssh_session(&config)?;
+            let channel = connection
+                .session
+                .channel_direct_tcpip(&request.host, request.port, None)
+                .map_err(|err| err.to_string())?;
+            connection.session.set_blocking(false);
+            write_proxy_success(&mut client, request.protocol)?;
+            if !request.preface.is_empty() {
+                let mut channel = channel;
+                write_all_nonblocking(&mut channel, &request.preface, &stop)
+                    .map_err(|err| err.to_string())?;
+                proxy_channel(client, channel, bytes_total, stop)?;
+                return Ok(());
+            }
+            proxy_channel(client, channel, bytes_total, stop)?;
+            Ok(())
+        },
+    );
+
+    Ok(TunnelHandle {
+        stop,
+        bytes_total,
+        active_connections,
+        ssh_shutdown: None,
+        listener_port: Some(config.local_port),
+        thread: Some(thread),
+    })
+}
+
+fn start_remote_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
+    let target_host = config
+        .remote_host
+        .clone()
+        .ok_or_else(|| "Target host is required for remote tunnels.".to_string())?;
+    let target_port = config
+        .remote_port
+        .ok_or_else(|| "Target port is required for remote tunnels.".to_string())?;
+    let SshConnection {
+        session,
+        shutdown: ssh_shutdown,
+    } = connect_ssh_session(config)?;
+    let (mut listener, _) = session
+        .channel_forward_listen(config.local_port, None, Some(32))
+        .map_err(|err| err.to_string())?;
+    session.set_blocking(false);
+    let stop = Arc::new(AtomicBool::new(false));
+    let bytes_total = Arc::new(AtomicU64::new(0));
+    let active_connections = ActiveConnections::default();
+    let stop_for_thread = stop.clone();
+    let bytes_for_thread = bytes_total.clone();
+    let active_for_thread = active_connections.clone();
+    let thread = thread::spawn(move || {
+        let _session = session;
+        while !stop_for_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok(channel) => match connect_target_stream(&target_host, target_port) {
+                    Ok(local) => {
+                        let bytes = bytes_for_thread.clone();
+                        let stop = stop_for_thread.clone();
+                        let active = active_for_thread.clone();
+                        let id = active.track(&local);
+                        thread::spawn(move || {
+                            if let Err(error) = proxy_channel(local, channel, bytes, stop) {
+                                log::warn!("Remote tunnel proxy ended with error: {error}");
+                            }
+                            active.untrack(id);
+                        });
+                    }
+                    Err(_) => {
+                        let mut channel = channel;
+                        let _ = channel.close();
+                    }
+                },
+                Err(_) => thread::sleep(Duration::from_millis(40)),
+            }
+        }
+    });
+
+    Ok(TunnelHandle {
+        stop,
+        bytes_total,
+        active_connections,
+        ssh_shutdown: Some(ssh_shutdown),
+        listener_port: None,
+        thread: Some(thread),
+    })
+}
+
+fn bind_local_listener(config: &SshConfig) -> Result<TcpListener, String> {
+    let (host, port) = tunnel_bind_addr(config);
+    let listener = TcpListener::bind((host, port))
+        .map_err(|err| format!("Local port {} is already in use: {err}", config.local_port))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| err.to_string())?;
+    Ok(listener)
+}
+
+fn connect_target_stream(host: &str, port: u16) -> io::Result<TcpStream> {
+    let mut last_error = None;
+    for address in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&address, Duration::from_secs(8)) {
+            Ok(stream) => {
+                stream.set_nodelay(true).ok();
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "target host did not resolve")))
+}
+
+fn spawn_listener_thread<F>(
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    bytes_total: Arc<AtomicU64>,
+    active_connections: ActiveConnections,
+    config: SshConfig,
+    handler: F,
+) -> JoinHandle<()>
+where
+    F: Fn(TcpStream, SshConfig, Arc<AtomicU64>, Arc<AtomicBool>) -> Result<(), String>
+        + Send
+        + Sync
+        + 'static,
+{
+    let handler = Arc::new(handler);
+    thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((client, _)) => {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let config = config.clone();
+                    let bytes_total = bytes_total.clone();
+                    let stop_for_client = stop.clone();
+                    let active = active_connections.clone();
+                    let id = active.track(&client);
+                    let handler = handler.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = handler(client, config, bytes_total, stop_for_client) {
+                            log::warn!("Tunnel client handler ended with error: {error}");
+                        }
+                        active.untrack(id);
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProxyProtocol {
+    Socks5,
+    HttpConnect,
+    HttpForward,
+}
+
+#[derive(Debug, Clone)]
+struct ProxyRequest {
+    protocol: ProxyProtocol,
+    host: String,
+    port: u16,
+    preface: Vec<u8>,
+}
+
+fn read_proxy_request(client: &mut TcpStream) -> Result<Option<ProxyRequest>, String> {
+    client
+        .set_nonblocking(false)
+        .map_err(|err| err.to_string())?;
+    client
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .map_err(|err| err.to_string())?;
+    let mut first = [0_u8; 1];
+    if client.read_exact(&mut first).is_err() {
+        return Ok(None);
+    }
+
+    if first[0] == 0x05 {
+        read_socks5_request(client)
+    } else {
+        read_http_connect_request(client, first[0])
+    }
+}
+
+fn read_socks5_request(client: &mut TcpStream) -> Result<Option<ProxyRequest>, String> {
+    let mut method_count = [0_u8; 1];
+    client
+        .read_exact(&mut method_count)
+        .map_err(|err| err.to_string())?;
+    let mut methods = vec![0_u8; method_count[0] as usize];
+    client
+        .read_exact(&mut methods)
+        .map_err(|err| err.to_string())?;
+    if !methods.contains(&0x00) {
+        client.write_all(&[0x05, 0xff]).ok();
+        return Ok(None);
+    }
+    client
+        .write_all(&[0x05, 0x00])
+        .map_err(|err| err.to_string())?;
+
+    let mut header = [0_u8; 4];
+    client
+        .read_exact(&mut header)
+        .map_err(|err| err.to_string())?;
+    if header[0] != 0x05 || header[1] != 0x01 {
+        write_socks5_failure(client).ok();
+        return Ok(None);
+    }
+
+    let host = match header[3] {
+        0x01 => {
+            let mut octets = [0_u8; 4];
+            client
+                .read_exact(&mut octets)
+                .map_err(|err| err.to_string())?;
+            std::net::Ipv4Addr::from(octets).to_string()
+        }
+        0x03 => {
+            let mut len = [0_u8; 1];
+            client.read_exact(&mut len).map_err(|err| err.to_string())?;
+            let mut domain = vec![0_u8; len[0] as usize];
+            client
+                .read_exact(&mut domain)
+                .map_err(|err| err.to_string())?;
+            String::from_utf8(domain).map_err(|_| "Invalid SOCKS5 domain.".to_string())?
+        }
+        0x04 => {
+            let mut octets = [0_u8; 16];
+            client
+                .read_exact(&mut octets)
+                .map_err(|err| err.to_string())?;
+            std::net::Ipv6Addr::from(octets).to_string()
+        }
+        _ => {
+            write_socks5_failure(client).ok();
+            return Ok(None);
+        }
+    };
+    let mut port_bytes = [0_u8; 2];
+    client
+        .read_exact(&mut port_bytes)
+        .map_err(|err| err.to_string())?;
+    let port = u16::from_be_bytes(port_bytes);
+
+    Ok(Some(ProxyRequest {
+        protocol: ProxyProtocol::Socks5,
+        host,
+        port,
+        preface: Vec::new(),
+    }))
+}
+
+fn read_http_connect_request(
+    client: &mut TcpStream,
+    first_byte: u8,
+) -> Result<Option<ProxyRequest>, String> {
+    let mut request = vec![first_byte];
+    let mut buf = [0_u8; 512];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        if request.len() > 8192 {
+            write_http_proxy_error(client, "413 Payload Too Large").ok();
+            return Ok(None);
+        }
+        let read = client.read(&mut buf).map_err(|err| err.to_string())?;
+        if read == 0 {
+            return Ok(None);
+        }
+        request.extend_from_slice(&buf[..read]);
+    }
+
+    let request_text = String::from_utf8_lossy(&request);
+    let first_line = request_text.lines().next().unwrap_or_default();
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or("HTTP/1.1");
+    if method.eq_ignore_ascii_case("CONNECT") {
+        let (host, port) = parse_host_port(target, 443)?;
+        return Ok(Some(ProxyRequest {
+            protocol: ProxyProtocol::HttpConnect,
+            host,
+            port,
+            preface: Vec::new(),
+        }));
+    }
+
+    let Some(stripped) = target.strip_prefix("http://") else {
+        write_http_proxy_error(client, "400 Bad Request").ok();
+        return Ok(None);
+    };
+    let (authority, path) = stripped
+        .split_once('/')
+        .map(|(authority, path)| (authority, format!("/{path}")))
+        .unwrap_or((stripped, "/".to_string()));
+    let (host, port) = parse_host_port(authority, 80)?;
+    let mut preface = format!("{method} {path} {version}\r\n").into_bytes();
+    preface.extend_from_slice(&forwardable_http_headers(&request)?);
+
+    Ok(Some(ProxyRequest {
+        protocol: ProxyProtocol::HttpForward,
+        host,
+        port,
+        preface,
+    }))
+}
+
+fn forwardable_http_headers(request: &[u8]) -> Result<Vec<u8>, String> {
+    let request_text = String::from_utf8_lossy(request);
+    let Some((_, headers)) = request_text.split_once("\r\n") else {
+        return Err("Invalid HTTP proxy request.".to_string());
+    };
+    let mut output = Vec::new();
+
+    for line in headers.split("\r\n") {
+        if line.is_empty() {
+            output.extend_from_slice(b"\r\n");
+            break;
+        }
+        let header_name = line.split_once(':').map(|(name, _)| name).unwrap_or(line);
+        if is_proxy_only_header(header_name) {
+            continue;
+        }
+        output.extend_from_slice(line.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+
+    Ok(output)
+}
+
+fn is_proxy_only_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+}
+
+fn parse_host_port(value: &str, default_port: u16) -> Result<(String, u16), String> {
+    if let Some(host) = value.strip_prefix('[') {
+        let Some((host, rest)) = host.split_once(']') else {
+            return Err("Invalid IPv6 CONNECT target.".into());
+        };
+        let port = rest
+            .strip_prefix(':')
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(default_port);
+        return Ok((host.to_string(), port));
+    }
+
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if let Ok(port) = port.parse() {
+            return Ok((host.to_string(), port));
+        }
+    }
+    Ok((value.to_string(), default_port))
+}
+
+fn write_proxy_success(client: &mut TcpStream, protocol: ProxyProtocol) -> Result<(), String> {
+    match protocol {
+        ProxyProtocol::Socks5 => client
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .map_err(|err| err.to_string()),
+        ProxyProtocol::HttpConnect => client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .map_err(|err| err.to_string()),
+        ProxyProtocol::HttpForward => Ok(()),
+    }
+}
+
+fn write_socks5_failure(client: &mut TcpStream) -> io::Result<()> {
+    client.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+}
+
+fn write_http_proxy_error(client: &mut TcpStream, status: &str) -> io::Result<()> {
+    write!(
+        client,
+        "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    )
+}
+
+fn proxy_channel(
+    mut client: TcpStream,
+    mut channel: Channel,
+    bytes_total: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    client.set_nonblocking(true).ok();
+    let mut client_closed = false;
+    let mut channel_closed = false;
+    let mut client_buffer = [0_u8; 32 * 1024];
+    let mut channel_buffer = [0_u8; 32 * 1024];
+
+    while !stop.load(Ordering::SeqCst) && !(client_closed && channel_closed) {
+        let mut progressed = false;
+
+        if !client_closed {
+            match client.read(&mut client_buffer) {
+                Ok(0) => {
+                    client_closed = true;
+                    let _ = channel.send_eof();
+                }
+                Ok(read) => {
+                    write_all_nonblocking(&mut channel, &client_buffer[..read], &stop)
+                        .map_err(|error| format!("write to SSH channel failed: {error}"))?;
+                    bytes_total.fetch_add(read as u64, Ordering::Relaxed);
+                    progressed = true;
+                }
+                Err(error) if is_would_block(&error) => {}
+                Err(error) => return Err(format!("read from client failed: {error}")),
+            }
+        }
+
+        if !channel_closed {
+            match channel.read(&mut channel_buffer) {
+                Ok(0) => {
+                    channel_closed = true;
+                    let _ = client.shutdown(Shutdown::Write);
+                }
+                Ok(read) => {
+                    write_all_nonblocking(&mut client, &channel_buffer[..read], &stop)
+                        .map_err(|error| format!("write to client failed: {error}"))?;
+                    bytes_total.fetch_add(read as u64, Ordering::Relaxed);
+                    progressed = true;
+                }
+                Err(error) if is_would_block(&error) => {}
+                Err(error) => return Err(format!("read from SSH channel failed: {error}")),
+            }
+        }
+
+        if !progressed {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let _ = channel.close();
+    let _ = client.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn write_all_nonblocking<W: Write>(
+    writer: &mut W,
+    mut data: &[u8],
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    while !data.is_empty() {
+        if stop.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "tunnel is stopping",
+            ));
+        }
+        match writer.write(data) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "write returned zero",
+                ))
+            }
+            Ok(written) => data = &data[written..],
+            Err(error) if is_would_block(&error) => thread::sleep(Duration::from_millis(5)),
+            Err(error) => return Err(error),
+        }
+    }
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "tunnel is stopping",
+            ));
+        }
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if is_would_block(&error) => thread::sleep(Duration::from_millis(5)),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_would_block(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || error.to_string().contains("EAGAIN")
+        || error.to_string().contains("WouldBlock")
 }
 
 fn stop_tunnel_by_id(runtime: &RuntimeState, id: &str) -> Result<(), String> {
@@ -458,19 +1108,14 @@ fn stop_tunnel_by_id(runtime: &RuntimeState, id: &str) -> Result<(), String> {
         .expect("runtime lock poisoned")
         .remove(id);
 
-    let child = runtime
-        .children
+    let tunnel = runtime
+        .tunnels
         .lock()
         .expect("runtime lock poisoned")
         .remove(id);
 
-    if let Some(mut child) = child {
-        child.kill().map_err(|err| err.to_string())?;
-        let _ = child.wait();
-    }
-
-    if let Ok(config) = find_config(id) {
-        stop_config_listener(&config)?;
+    if let Some(tunnel) = tunnel {
+        tunnel.join();
     }
 
     Ok(())
@@ -507,8 +1152,8 @@ fn start_service_with_runtime(runtime: &RuntimeState) -> ServiceReport {
 
 fn stop_service_with_runtime(runtime: &RuntimeState) -> ServiceReport {
     let connections = config::load_state().connections;
-    let child_ids: HashSet<String> = runtime
-        .children
+    let tunnel_ids: HashSet<String> = runtime
+        .tunnels
         .lock()
         .expect("runtime lock poisoned")
         .keys()
@@ -526,7 +1171,7 @@ fn stop_service_with_runtime(runtime: &RuntimeState) -> ServiceReport {
         stopped_ids.insert(config.id);
     }
 
-    for id in child_ids.difference(&stopped_ids) {
+    for id in tunnel_ids.difference(&stopped_ids) {
         if let Err(error) = stop_tunnel_by_id(runtime, &id) {
             failed.push(format!("{id}: {error}"));
         }
@@ -544,12 +1189,12 @@ fn stop_service_with_runtime(runtime: &RuntimeState) -> ServiceReport {
 }
 
 fn terminate_managed_children(runtime: &RuntimeState) {
-    let children: Vec<Child> = runtime
-        .children
+    let tunnels: Vec<TunnelHandle> = runtime
+        .tunnels
         .lock()
         .expect("runtime lock poisoned")
         .drain()
-        .map(|(_, child)| child)
+        .map(|(_, tunnel)| tunnel)
         .collect();
 
     runtime
@@ -563,62 +1208,20 @@ fn terminate_managed_children(runtime: &RuntimeState) {
         .expect("runtime lock poisoned")
         .clear();
 
-    for mut child in children {
-        let _ = child.kill();
-        let _ = child.wait();
+    for tunnel in tunnels {
+        tunnel.join();
     }
-}
-
-fn stop_config_listener(config: &SshConfig) -> Result<(), String> {
-    if matches!(config.tunnel_type, TunnelType::Remote) {
-        return Ok(());
-    }
-
-    let ports = HashSet::from([config.local_port]);
-    let pids = listening_local_port_pids(&ports);
-
-    for pid in pids.get(&config.local_port).into_iter().flatten() {
-        let _ = kill_pid(*pid);
-    }
-
-    Ok(())
-}
-
-fn kill_pid(pid: u32) -> Result<(), String> {
-    let status = Command::new("kill")
-        .arg(pid.to_string())
-        .status()
-        .map_err(|err| err.to_string())?;
-
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| format!("kill exited with {status}"))
 }
 
 fn service_status_with_runtime(runtime: &RuntimeState) -> ServiceStatus {
     let connections = config::load_state().connections;
     let active_ids = active_tunnel_ids(runtime);
-    let local_ports: HashSet<u16> = connections
-        .iter()
-        .filter(|connection| !matches!(connection.tunnel_type, TunnelType::Remote))
-        .map(|connection| connection.local_port)
-        .collect();
-    let listening_ports = listening_local_ports(&local_ports);
-    let running_by_port = connections
-        .iter()
-        .filter(|connection| {
-            !matches!(connection.tunnel_type, TunnelType::Remote)
-                && listening_ports.contains(&connection.local_port)
-        })
-        .count();
-    let running = active_ids.len().max(running_by_port);
-    let traffic = sample_tunnel_traffic(runtime, &local_ports);
+    let traffic = sample_tunnel_traffic(runtime);
 
     ServiceStatus {
         total: connections.len(),
-        running,
-        clients: count_local_clients(&local_ports),
+        running: active_ids.len(),
+        clients: active_tunnel_connection_count(runtime),
         traffic_bytes_per_second: traffic.0,
         traffic_bytes_total: traffic.1,
     }
@@ -645,30 +1248,33 @@ fn reconcile_runtime(app: &AppHandle) {
         if matches!(config.auth_profile, AuthProfile::Mfa) || !config.auto_reconnect {
             continue;
         }
-        if !child_is_running(&runtime, &config.id) {
-            let _ = start_ssh_child(&runtime, config);
+        if !tunnel_is_running(&runtime, &config.id) {
+            let _ = start_ssh_tunnel(&runtime, config);
         }
     }
 }
 
-fn child_is_running(runtime: &RuntimeState, id: &str) -> bool {
-    let mut children = runtime.children.lock().expect("runtime lock poisoned");
-    if let Some(child) = children.get_mut(id) {
-        match child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(_)) | Err(_) => {
-                children.remove(id);
-                false
+fn tunnel_is_running(runtime: &RuntimeState, id: &str) -> bool {
+    let stopped = {
+        let mut tunnels = runtime.tunnels.lock().expect("runtime lock poisoned");
+        if let Some(tunnel) = tunnels.get(id) {
+            if tunnel.is_running() {
+                return true;
             }
+            tunnels.remove(id)
+        } else {
+            None
         }
-    } else {
-        false
+    };
+
+    if let Some(tunnel) = stopped {
+        tunnel.join();
     }
+    false
 }
 
-fn sample_tunnel_traffic(runtime: &RuntimeState, local_ports: &HashSet<u16>) -> (u64, u64) {
-    let pids = tunnel_process_pids(runtime, local_ports);
-    let bytes_total = traffic_bytes_for_pids(&pids).unwrap_or(0);
+fn sample_tunnel_traffic(runtime: &RuntimeState) -> (u64, u64) {
+    let bytes_total = tunnel_bytes_total(runtime);
     let now = Instant::now();
     let mut traffic = runtime.traffic.lock().expect("runtime lock poisoned");
     let bytes_per_second = traffic
@@ -689,196 +1295,24 @@ fn sample_tunnel_traffic(runtime: &RuntimeState, local_ports: &HashSet<u16>) -> 
     (bytes_per_second, bytes_total)
 }
 
-fn tunnel_process_pids(runtime: &RuntimeState, local_ports: &HashSet<u16>) -> HashSet<u32> {
-    let mut pids: HashSet<u32> = runtime
-        .children
+fn tunnel_bytes_total(runtime: &RuntimeState) -> u64 {
+    runtime
+        .tunnels
         .lock()
         .expect("runtime lock poisoned")
         .values()
-        .map(Child::id)
-        .collect();
-
-    for pid in listening_local_port_pids(local_ports).values().flatten() {
-        pids.insert(*pid);
-    }
-
-    pids
-}
-
-fn traffic_bytes_for_pids(pids: &HashSet<u32>) -> Option<u64> {
-    if pids.is_empty() {
-        return Some(0);
-    }
-
-    let mut command = Command::new("nettop");
-    command
-        .arg("-P")
-        .arg("-x")
-        .arg("-L")
-        .arg("1")
-        .arg("-J")
-        .arg("bytes_in,bytes_out");
-
-    for pid in pids {
-        command.arg("-p").arg(pid.to_string());
-    }
-
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    Some(parse_nettop_traffic(
-        &String::from_utf8_lossy(&output.stdout),
-        pids,
-    ))
-}
-
-fn parse_nettop_traffic(output: &str, pids: &HashSet<u32>) -> u64 {
-    output
-        .lines()
-        .filter_map(|line| parse_nettop_process_bytes(line, pids))
+        .map(|tunnel| tunnel.bytes_total.load(Ordering::Relaxed))
         .sum()
 }
 
-fn parse_nettop_process_bytes(line: &str, pids: &HashSet<u32>) -> Option<u64> {
-    let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-    let pid_fields: HashSet<String> = pids.iter().map(u32::to_string).collect();
-    let process_field = fields.first().copied().unwrap_or_default();
-
-    let has_matching_pid = fields.iter().any(|field| pid_fields.contains(*field))
-        || pids
-            .iter()
-            .any(|pid| process_field.ends_with(&format!(".{pid}")));
-
-    if !has_matching_pid {
-        return None;
-    }
-
-    let numeric_values: Vec<u64> = fields
-        .iter()
-        .filter(|field| !pid_fields.contains(**field))
-        .filter_map(|field| field.parse::<u64>().ok())
-        .collect();
-
-    let byte_fields = numeric_values.iter().rev().take(2).sum();
-    Some(byte_fields)
-}
-
-fn listening_local_ports(local_ports: &HashSet<u16>) -> HashSet<u16> {
-    if local_ports.is_empty() {
-        return HashSet::new();
-    }
-
-    let output = match Command::new("lsof")
-        .arg("-nP")
-        .arg("-iTCP")
-        .arg("-sTCP:LISTEN")
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return HashSet::new(),
-    };
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(local_listen_port_from_lsof_line)
-        .filter(|port| local_ports.contains(port))
-        .collect()
-}
-
-fn listening_local_port_pids(local_ports: &HashSet<u16>) -> HashMap<u16, Vec<u32>> {
-    if local_ports.is_empty() {
-        return HashMap::new();
-    }
-
-    let output = match Command::new("lsof")
-        .arg("-nP")
-        .arg("-iTCP")
-        .arg("-sTCP:LISTEN")
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return HashMap::new(),
-    };
-
-    let mut pids: HashMap<u16, Vec<u32>> = HashMap::new();
-    for (port, pid) in String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(local_listener_pid_from_lsof_line)
-        .filter(|(port, _)| local_ports.contains(port))
-    {
-        pids.entry(port).or_default().push(pid);
-    }
-    pids
-}
-
-fn count_local_clients(local_ports: &HashSet<u16>) -> usize {
-    if local_ports.is_empty() {
-        return 0;
-    }
-
-    established_local_port_counts()
-        .into_iter()
-        .filter(|(port, _)| local_ports.contains(port))
-        .map(|(_, count)| count)
+fn active_tunnel_connection_count(runtime: &RuntimeState) -> usize {
+    runtime
+        .tunnels
+        .lock()
+        .expect("runtime lock poisoned")
+        .values()
+        .map(TunnelHandle::active_count)
         .sum()
-}
-
-fn established_local_port_counts() -> HashMap<u16, usize> {
-    let output = match Command::new("lsof")
-        .arg("-nP")
-        .arg("-iTCP")
-        .arg("-sTCP:ESTABLISHED")
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return HashMap::new(),
-    };
-
-    let mut counts = HashMap::new();
-    for port in String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(local_port_from_lsof_line)
-    {
-        *counts.entry(port).or_insert(0) += 1;
-    }
-    counts
-}
-
-fn local_port_from_lsof_line(line: &str) -> Option<u16> {
-    if !line.contains("TCP ") || !line.contains("->") || !line.contains("(ESTABLISHED)") {
-        return None;
-    }
-
-    let before_arrow = line.split("->").next()?;
-    let port_text = before_arrow.rsplit(':').next()?.trim();
-    port_text.parse().ok()
-}
-
-fn local_listen_port_from_lsof_line(line: &str) -> Option<u16> {
-    if !line.contains("TCP ") || !line.contains("(LISTEN)") {
-        return None;
-    }
-
-    let before_state = line.split(" (LISTEN)").next()?;
-    let port_text = before_state.rsplit(':').next()?.trim();
-    port_text.parse().ok()
-}
-
-fn local_listener_pid_from_lsof_line(line: &str) -> Option<(u16, u32)> {
-    if !line.contains("TCP ") || !line.contains("(LISTEN)") {
-        return None;
-    }
-
-    let mut columns = line.split_whitespace();
-    let command = columns.next()?;
-    if command != "ssh" {
-        return None;
-    }
-    let pid = columns.next()?.parse().ok()?;
-    let port = local_listen_port_from_lsof_line(line)?;
-    Some((port, pid))
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -1199,16 +1633,10 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
 #[tauri::command]
 fn list_connections(runtime: State<'_, RuntimeState>) -> Vec<ConnectionView> {
     let connections = config::load_state().connections;
-    let local_ports: HashSet<u16> = connections
-        .iter()
-        .filter(|connection| !matches!(connection.tunnel_type, TunnelType::Remote))
-        .map(|connection| connection.local_port)
-        .collect();
-    let listening_ports = listening_local_ports(&local_ports);
 
     connections
         .into_iter()
-        .map(|config| connection_view(&runtime, config, &listening_ports))
+        .map(|config| connection_view(&runtime, config))
         .collect()
 }
 
@@ -1260,6 +1688,12 @@ fn delete_connection(
     keychain::delete_credentials(&id);
     update_tray_status(&app);
     Ok(())
+}
+
+#[tauri::command]
+fn reset_known_host(id: String) -> Result<bool, String> {
+    let config = find_config(&id)?;
+    reset_known_host_for_config(&config)
 }
 
 #[tauri::command]
@@ -1348,7 +1782,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(RuntimeState {
-            children: Mutex::new(HashMap::new()),
+            tunnels: Mutex::new(HashMap::new()),
             traffic: Mutex::new(None),
             desired: Mutex::new(HashSet::new()),
             needs_auth: Mutex::new(HashSet::new()),
@@ -1381,6 +1815,7 @@ pub fn run() {
             list_connections,
             save_connection,
             delete_connection,
+            reset_known_host,
             start_tunnel,
             stop_tunnel,
             start_service,
@@ -1466,13 +1901,15 @@ mod tests {
     }
 
     #[test]
-    fn builds_tunnel_arguments() {
-        let local = base_config();
-        assert_eq!(tunnel_arg(&local), "18080:127.0.0.1:80");
-
-        let mut dynamic = base_config();
-        dynamic.tunnel_type = TunnelType::Dynamic;
-        assert_eq!(tunnel_arg(&dynamic), "18080");
+    fn formats_known_host_names_for_default_and_custom_ports() {
+        assert_eq!(
+            known_hosts::known_host_name("example.com", 22),
+            "example.com"
+        );
+        assert_eq!(
+            known_hosts::known_host_name("example.com", 55222),
+            "[example.com]:55222"
+        );
     }
 
     #[test]
@@ -1515,27 +1952,153 @@ mod tests {
         let mut config = base_config();
         config.local_port = listener.local_addr().unwrap().port();
         let runtime = RuntimeState {
-            children: Mutex::new(HashMap::new()),
+            tunnels: Mutex::new(HashMap::new()),
             traffic: Mutex::new(None),
             desired: Mutex::new(HashSet::new()),
             needs_auth: Mutex::new(HashSet::new()),
         };
 
-        assert_eq!(
-            start_config_preflight(&runtime, &config),
-            Err(format!(
-                "Local port {} is already in use.",
-                config.local_port
-            ))
-        );
+        let error = start_config_preflight(&runtime, &config).unwrap_err();
+        assert!(error.contains(&format!(
+            "Local port {} is already in use",
+            config.local_port
+        )));
     }
 
     #[test]
-    fn terminate_managed_children_clears_runtime_without_external_port_scan() {
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
-        let pid = child.id();
+    fn stop_handle_shuts_down_active_connections() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let active_connections = ActiveConnections::default();
+        active_connections.track(&server);
+        let handle = TunnelHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            bytes_total: Arc::new(AtomicU64::new(0)),
+            active_connections,
+            ssh_shutdown: None,
+            listener_port: None,
+            thread: None,
+        };
+
+        handle.stop();
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn parses_socks5_probe_and_connect_request() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            tx.send(read_proxy_request(&mut stream).unwrap().unwrap())
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).unwrap();
+        let mut response = [0_u8; 2];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(response, [0x05, 0x00]);
+        client
+            .write_all(&[
+                0x05, 0x01, 0x00, 0x03, 0x0b, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c',
+                b'o', b'm', 0x01, 0xbb,
+            ])
+            .unwrap();
+
+        let request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+
+        assert!(matches!(request.protocol, ProxyProtocol::Socks5));
+        assert_eq!(request.host, "example.com");
+        assert_eq!(request.port, 443);
+        assert!(request.preface.is_empty());
+    }
+
+    #[test]
+    fn parses_http_connect_proxy_request() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            tx.send(read_proxy_request(&mut stream).unwrap().unwrap())
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"CONNECT example.com:8443 HTTP/1.1\r\nHost: example.com:8443\r\n\r\n")
+            .unwrap();
+
+        let request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+
+        assert!(matches!(request.protocol, ProxyProtocol::HttpConnect));
+        assert_eq!(request.host, "example.com");
+        assert_eq!(request.port, 8443);
+        assert!(request.preface.is_empty());
+    }
+
+    #[test]
+    fn rewrites_plain_http_proxy_request_to_origin_form() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            tx.send(read_proxy_request(&mut stream).unwrap().unwrap())
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(
+                b"GET http://example.com:8080/path?q=1 HTTP/1.1\r\nHost: example.com:8080\r\nProxy-Connection: keep-alive\r\n\r\n",
+            )
+            .unwrap();
+
+        let request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+
+        assert!(matches!(request.protocol, ProxyProtocol::HttpForward));
+        assert_eq!(request.host, "example.com");
+        assert_eq!(request.port, 8080);
+        let preface = String::from_utf8(request.preface).unwrap();
+        assert!(preface.starts_with("GET /path?q=1 HTTP/1.1\r\n"));
+        assert!(!preface.to_ascii_lowercase().contains("proxy-connection"));
+    }
+
+    #[test]
+    fn matches_known_hosts_lines_for_reset() {
+        assert!(known_hosts::known_hosts_line_matches(
+            "[example.com]:55222 ssh-ed25519 AAAA",
+            "[example.com]:55222"
+        ));
+        assert!(known_hosts::known_hosts_line_matches(
+            "example.com,192.0.2.1 ssh-ed25519 AAAA",
+            "192.0.2.1"
+        ));
+        assert!(!known_hosts::known_hosts_line_matches(
+            "other.example.com ssh-ed25519 AAAA",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn terminate_managed_children_clears_runtime_state() {
         let runtime = RuntimeState {
-            children: Mutex::new(HashMap::from([("test-id".to_string(), child)])),
+            tunnels: Mutex::new(HashMap::new()),
             traffic: Mutex::new(None),
             desired: Mutex::new(HashSet::from(["test-id".to_string()])),
             needs_auth: Mutex::new(HashSet::from(["test-id".to_string()])),
@@ -1544,7 +2107,7 @@ mod tests {
         terminate_managed_children(&runtime);
 
         assert!(runtime
-            .children
+            .tunnels
             .lock()
             .expect("runtime lock poisoned")
             .is_empty());
@@ -1558,69 +2121,33 @@ mod tests {
             .lock()
             .expect("runtime lock poisoned")
             .is_empty());
-        assert!(Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| !status.success())
-            .unwrap_or(true));
     }
 
     #[test]
-    fn parses_lsof_established_local_port() {
-        let line =
-            "ssh 12345 me 7u IPv4 0xabc 0t0 TCP 127.0.0.1:18080->127.0.0.1:53122 (ESTABLISHED)";
+    fn counts_active_connections_from_runtime_state() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let active_connections = ActiveConnections::default();
+        active_connections.track(&server);
+        let runtime = RuntimeState {
+            tunnels: Mutex::new(HashMap::from([(
+                "test-id".to_string(),
+                TunnelHandle {
+                    stop: Arc::new(AtomicBool::new(false)),
+                    bytes_total: Arc::new(AtomicU64::new(0)),
+                    active_connections,
+                    ssh_shutdown: None,
+                    listener_port: None,
+                    thread: None,
+                },
+            )])),
+            traffic: Mutex::new(None),
+            desired: Mutex::new(HashSet::new()),
+            needs_auth: Mutex::new(HashSet::new()),
+        };
 
-        assert_eq!(local_port_from_lsof_line(line), Some(18080));
-        assert_eq!(local_port_from_lsof_line("COMMAND PID USER"), None);
-    }
-
-    #[test]
-    fn parses_lsof_listening_port() {
-        let line = "ssh 12345 me 7u IPv4 0xabc 0t0 TCP 127.0.0.1:18080 (LISTEN)";
-
-        assert_eq!(local_listen_port_from_lsof_line(line), Some(18080));
-        assert_eq!(
-            local_listener_pid_from_lsof_line(line),
-            Some((18080, 12345))
-        );
-    }
-
-    #[test]
-    fn ignores_non_ssh_lsof_listeners() {
-        let line = "node 12345 me 7u IPv4 0xabc 0t0 TCP 127.0.0.1:18080 (LISTEN)";
-
-        assert_eq!(local_listener_pid_from_lsof_line(line), None);
-    }
-
-    #[test]
-    fn parses_nettop_bytes_for_matching_pids_only() {
-        let pids = HashSet::from([12345]);
-        let output = "\
-process,pid,bytes_in,bytes_out
-ssh,12345,1200,800
-ssh,912345,9999,9999
-ssh.12345,300,200
-node,22222,500,500
-";
-
-        assert_eq!(parse_nettop_traffic(output, &pids), 2500);
-    }
-
-    #[test]
-    fn parses_nettop_bytes_without_counting_pid_as_traffic() {
-        let pids = HashSet::from([12345]);
-        let line = "ssh,12345,10,20";
-
-        assert_eq!(parse_nettop_process_bytes(line, &pids), Some(30));
-    }
-
-    #[test]
-    fn parses_nettop_process_name_pid_format() {
-        let pids = HashSet::from([51844]);
-        let line = "ssh.51844,10978619,14543350";
-
-        assert_eq!(parse_nettop_process_bytes(line, &pids), Some(25_521_969));
+        assert_eq!(active_tunnel_connection_count(&runtime), 1);
+        drop(client);
     }
 }

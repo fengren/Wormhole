@@ -5,6 +5,7 @@ import { check } from "@tauri-apps/plugin-updater";
 import {
   Activity,
   Download,
+  KeyRound,
   Languages,
   LayoutDashboard,
   Network,
@@ -68,6 +69,12 @@ type ServiceStatus = {
   traffic_bytes_total: number;
 };
 
+type MessageAction = {
+  label: string;
+  action: string;
+  id?: string;
+};
+
 type MonitorSample = {
   time: number;
   clients: number;
@@ -105,6 +112,7 @@ let serviceStatus: ServiceStatus = {
 };
 let message = "";
 let messageKind: "info" | "error" = "info";
+let messageAction: MessageAction | null = null;
 let monitorSamples: MonitorSample[] = [];
 let updateState: UpdateState = "idle";
 let updateProgress = 0;
@@ -114,6 +122,7 @@ const app = document.querySelector<HTMLDivElement>("#app");
 const lucideIcons = {
   Activity,
   Download,
+  KeyRound,
   Languages,
   LayoutDashboard,
   Network,
@@ -193,7 +202,6 @@ type I18nKey =
   | "quick.quit"
   | "quick.noTunnels"
   | "quick.openFullApp"
-  | "message.saved"
   | "message.deleted"
   | "message.tunnelStopped"
   | "message.serviceStarted"
@@ -201,6 +209,9 @@ type I18nKey =
   | "message.withIssues"
   | "message.serviceStartedDetail"
   | "message.serviceStoppedDetail"
+  | "message.resetKnownHost"
+  | "message.knownHostReset"
+  | "message.knownHostMissing"
   | "settings.title"
   | "settings.subtitle"
   | "settings.language"
@@ -278,7 +289,6 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "quick.quit": "Quit",
     "quick.noTunnels": "No tunnels",
     "quick.openFullApp": "Open the full app to add a tunnel.",
-    "message.saved": "Saved.",
     "message.deleted": "Deleted.",
     "message.tunnelStopped": "Tunnel stopped.",
     "message.serviceStarted": "Started",
@@ -286,6 +296,9 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "message.withIssues": "{action} with {count} issue(s): {issues}",
     "message.serviceStartedDetail": "Service started. {running}/{total} tunnel(s) running, {clients} client(s) connected.",
     "message.serviceStoppedDetail": "Service stopped. {total} tunnel(s) stopped, {clients} client(s) connected.",
+    "message.resetKnownHost": "Reset host key",
+    "message.knownHostReset": "Host key reset. Start the tunnel again to trust the new key.",
+    "message.knownHostMissing": "No saved host key was found for this tunnel.",
     "settings.title": "Settings",
     "settings.subtitle": "Language, version, and update controls.",
     "settings.language": "Language",
@@ -362,7 +375,6 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "quick.quit": "退出",
     "quick.noTunnels": "没有隧道",
     "quick.openFullApp": "打开完整应用添加隧道。",
-    "message.saved": "已保存。",
     "message.deleted": "已删除。",
     "message.tunnelStopped": "隧道已停止。",
     "message.serviceStarted": "启动",
@@ -370,6 +382,9 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "message.withIssues": "{action}完成，但有 {count} 个问题：{issues}",
     "message.serviceStartedDetail": "服务已启动。{running}/{total} 个隧道运行中，{clients} 个客户端已连接。",
     "message.serviceStoppedDetail": "服务已停止。{total} 个隧道已停止，{clients} 个客户端已连接。",
+    "message.resetKnownHost": "重置主机密钥",
+    "message.knownHostReset": "主机密钥已重置，请重新启动隧道以信任新密钥。",
+    "message.knownHostMissing": "没有找到这条隧道已保存的主机密钥。",
     "settings.title": "设置",
     "settings.subtitle": "语言、版本信息和更新控制。",
     "settings.language": "语言",
@@ -497,14 +512,34 @@ function formatSampleTime(timestamp: number): string {
   }).format(new Date(timestamp));
 }
 
-function showMessage(nextMessage: string, kind: "info" | "error" = "info") {
+function showMessage(
+  nextMessage: string,
+  kind: "info" | "error" = "info",
+  action: MessageAction | null = null,
+) {
   message = nextMessage;
   messageKind = kind;
+  messageAction = action;
   const target = document.querySelector<HTMLDivElement>("#message");
   if (target) {
-    target.textContent = message;
+    target.innerHTML = renderMessageContent();
     target.dataset.kind = kind;
+    hydrateIcons();
   }
+}
+
+function renderMessageContent() {
+  if (!message) return "";
+  const actionMarkup = messageAction
+    ? `<button type="button" class="message-action" data-action="${escapeHtml(messageAction.action)}" ${messageAction.id ? `data-id="${escapeHtml(messageAction.id)}"` : ""}>${icon("key-round")} ${escapeHtml(messageAction.label)}</button>`
+    : "";
+  return `<span>${escapeHtml(message)}</span>${actionMarkup}`;
+}
+
+function hostKeyMismatchAction(error: unknown, id: string): MessageAction | null {
+  return String(error).toLowerCase().includes("host key mismatch")
+    ? { label: t("message.resetKnownHost"), action: "reset-known-host", id }
+    : null;
 }
 
 function serviceMessage(action: "started" | "stopped", report: ServiceReport): string {
@@ -651,10 +686,19 @@ async function startTunnel(id: string) {
     await invoke<Connection>("start_tunnel", { id });
     await loadConnections();
   } catch (error) {
-    showMessage(String(error), "error");
+    showMessage(String(error), "error", hostKeyMismatchAction(error, id));
   } finally {
     busyId = null;
     render();
+  }
+}
+
+async function resetKnownHost(id: string) {
+  try {
+    const removed = await invoke<boolean>("reset_known_host", { id });
+    showMessage(removed ? t("message.knownHostReset") : t("message.knownHostMissing"));
+  } catch (error) {
+    showMessage(String(error), "error");
   }
 }
 
@@ -1256,7 +1300,7 @@ function render() {
         <div class="connection-list">${renderList()}</div>
       </aside>
       <section class="workspace">
-        <div id="message" class="message" data-kind="${messageKind}">${escapeHtml(message)}</div>
+        <div id="message" class="message" data-kind="${messageKind}">${renderMessageContent()}</div>
         ${workspaceContent}
       </section>
     </main>
@@ -1283,6 +1327,7 @@ async function handleAction(action: string, id: string | null, lang: string | nu
   if (action === "check-update" && !isQuickPanel) await checkForUpdates();
   if (action === "restart-app" && !isQuickPanel) await restartApp();
   if (action === "language" && (lang === "en" || lang === "zh")) setLanguage(lang);
+  if (action === "reset-known-host" && id) await resetKnownHost(id);
 }
 
 function bindRenderedControls() {

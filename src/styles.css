@@ -469,13 +469,40 @@ button:disabled {
 }
 
 .message {
+  display: flex;
+  min-width: 0;
   min-height: 16px;
+  align-items: center;
+  gap: 10px;
   color: #60706c;
   font-size: 13px;
 }
 
+.message span {
+  min-width: 0;
+}
+
 .message[data-kind="error"] {
   color: #b42318;
+}
+
+.message-action {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #e7b6b1;
+  border-radius: 7px;
+  background: #fff8f7;
+  color: #9f1c13;
+  font-size: 12px;
+  font-weight: 720;
+  padding: 4px 9px;
+}
+
+.message-action:hover {
+  border-color: #d4877f;
+  background: #fff0ef;
 }
 
 .overview,
