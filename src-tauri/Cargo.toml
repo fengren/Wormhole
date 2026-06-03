@@ -1,6 +1,6 @@
 [package]
 name = "wormhole"
-version = "0.4.2"
+version = "0.4.3"
 description = "SSH Tunnel Manager for macOS"
 authors = ["zhengwei"]
 edition = "2021"

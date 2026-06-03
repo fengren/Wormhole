@@ -5,9 +5,12 @@ import { check } from "@tauri-apps/plugin-updater";
 import {
   Activity,
   Download,
+  Files,
   KeyRound,
   Languages,
   LayoutDashboard,
+  MonitorDown,
+  MonitorUp,
   Network,
   Plus,
   Power,
@@ -18,7 +21,6 @@ import {
   Settings,
   Trash2,
   Users,
-  Waypoints,
   Worm,
   createIcons,
 } from "lucide";
@@ -129,9 +131,12 @@ const app = document.querySelector<HTMLDivElement>("#app");
 const lucideIcons = {
   Activity,
   Download,
+  Files,
   KeyRound,
   Languages,
   LayoutDashboard,
+  MonitorDown,
+  MonitorUp,
   Network,
   Plus,
   Power,
@@ -142,7 +147,6 @@ const lucideIcons = {
   Settings,
   Trash2,
   Users,
-  Waypoints,
   Worm,
 };
 
@@ -217,6 +221,7 @@ type I18nKey =
   | "message.serviceStartedDetail"
   | "message.serviceStoppedDetail"
   | "message.resetKnownHost"
+  | "message.copiedTunnel"
   | "message.knownHostReset"
   | "message.knownHostMissing"
   | "settings.title"
@@ -227,6 +232,7 @@ type I18nKey =
   | "settings.versionHint"
   | "settings.updates"
   | "settings.updatesHint"
+  | "action.copyTunnel"
   | "update.check"
   | "update.checking"
   | "update.downloading"
@@ -300,6 +306,7 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "message.serviceStartedDetail": "Service started. {running}/{total} tunnel(s) running, {clients} client(s) connected.",
     "message.serviceStoppedDetail": "Service stopped. {total} tunnel(s) stopped, {clients} client(s) connected.",
     "message.resetKnownHost": "Reset host key",
+    "message.copiedTunnel": "Tunnel address copied.",
     "message.knownHostReset": "Host key reset. Start the tunnel again to trust the new key.",
     "message.knownHostMissing": "No saved host key was found for this tunnel.",
     "settings.title": "Settings",
@@ -310,6 +317,7 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "settings.versionHint": "Current installed Wormhole version.",
     "settings.updates": "Updates",
     "settings.updatesHint": "Check GitHub Releases for a signed Wormhole update.",
+    "action.copyTunnel": "Copy tunnel address",
     "update.check": "Check updates",
     "update.checking": "Checking for updates...",
     "update.downloading": "Downloading update: {progress}%",
@@ -382,6 +390,7 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "message.serviceStartedDetail": "服务已启动。{running}/{total} 个隧道运行中，{clients} 个客户端已连接。",
     "message.serviceStoppedDetail": "服务已停止。{total} 个隧道已停止，{clients} 个客户端已连接。",
     "message.resetKnownHost": "重置主机密钥",
+    "message.copiedTunnel": "已复制隧道地址。",
     "message.knownHostReset": "主机密钥已重置，请重新启动隧道以信任新密钥。",
     "message.knownHostMissing": "没有找到这条隧道已保存的主机密钥。",
     "settings.title": "设置",
@@ -392,6 +401,7 @@ const translations: Record<Language, Record<I18nKey, string>> = {
     "settings.versionHint": "当前安装的 Wormhole 版本。",
     "settings.updates": "更新",
     "settings.updatesHint": "从 GitHub Releases 检查签名更新包。",
+    "action.copyTunnel": "复制隧道地址",
     "update.check": "检查更新",
     "update.checking": "正在检查更新...",
     "update.downloading": "正在下载更新：{progress}%",
@@ -440,12 +450,29 @@ function escapeHtml(value: unknown): string {
 
 function connectionSummary(connection: Connection): string {
   if (connection.tunnel_type === "dynamic") {
-    return `SOCKS/HTTP 127.0.0.1:${connection.local_port}`;
+    return `SOCKS5 127.0.0.1:${connection.local_port}`;
   }
+  return reachableAddress(connection);
+}
+
+function reachableAddress(connection: Connection): string {
   if (connection.tunnel_type === "remote") {
-    return `${connection.remote_host ?? "127.0.0.1"}:${connection.remote_port ?? ""}`;
+    return `${connection.host}:${connection.local_port}`;
   }
-  return `127.0.0.1:${connection.local_port} -> ${connection.remote_host}:${connection.remote_port}`;
+  return `127.0.0.1:${connection.local_port}`;
+}
+
+function copyableTunnelAddress(connection: Connection): string {
+  if (connection.tunnel_type === "dynamic") {
+    return `socks5://127.0.0.1:${connection.local_port}`;
+  }
+  return reachableAddress(connection);
+}
+
+function tunnelIconName(type: TunnelType): string {
+  if (type === "local") return "monitor-down";
+  if (type === "remote") return "monitor-up";
+  return "router";
 }
 
 function statusText(status: TunnelStatus): string {
@@ -836,6 +863,50 @@ async function restartApp() {
   await invoke("restart_app");
 }
 
+async function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall back to the textarea path when clipboard permissions are restricted.
+    }
+  }
+
+  const input = document.createElement("textarea");
+  input.value = value;
+  input.setAttribute("readonly", "");
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.append(input);
+  input.select();
+  document.execCommand("copy");
+  input.remove();
+}
+
+async function copyTunnel(id: string) {
+  const connection = connections.find((item) => item.id === id);
+  if (!connection) return;
+  await copyText(copyableTunnelAddress(connection));
+  showMessage(t("message.copiedTunnel"));
+}
+
+function renderCopyButton(connection: Connection, compact = false) {
+  const address = copyableTunnelAddress(connection);
+  return `
+    <button
+      type="button"
+      class="copy-tunnel-button ${compact ? "compact" : ""}"
+      data-action="copy-tunnel"
+      data-id="${escapeHtml(connection.id)}"
+      title="${escapeHtml(t("action.copyTunnel"))}: ${escapeHtml(address)}"
+      aria-label="${escapeHtml(t("action.copyTunnel"))}"
+    >
+      ${icon("files")}
+    </button>
+  `;
+}
+
 function renderList() {
   if (connections.length === 0) {
     return `<div class="empty">${escapeHtml(t("noTunnels"))}</div>`;
@@ -845,15 +916,18 @@ function renderList() {
     .map(
       (connection) => `
         <div class="connection-row ${connection.id === selectedId ? "selected" : ""}">
-          <button class="connection-select" type="button" data-action="select" data-id="${escapeHtml(connection.id)}">
+          <div class="connection-select" role="button" tabindex="0" data-action="select" data-id="${escapeHtml(connection.id)}">
             <span class="connection-icon ${connection.status}">
-              ${icon(connection.tunnel_type === "dynamic" ? "router" : "waypoints")}
+              ${icon(tunnelIconName(connection.tunnel_type))}
             </span>
             <span class="connection-main">
               <span class="connection-name">${escapeHtml(connection.name)}</span>
-              <span class="connection-summary">${escapeHtml(connectionSummary(connection))}</span>
+              <span class="connection-summary-line">
+                <span class="connection-summary">${escapeHtml(connectionSummary(connection))}</span>
+                ${renderCopyButton(connection)}
+              </span>
             </span>
-          </button>
+          </div>
           ${renderTunnelSwitch(connection)}
         </div>
       `,
@@ -1147,15 +1221,18 @@ function renderQuickRows() {
     .map(
       (connection) => `
         <article class="quick-row ${connection.status} ${connection.id === (selectedId ?? connections[0]?.id) ? "selected" : ""}">
-          <button type="button" class="quick-row-main" data-action="select-quick" data-id="${escapeHtml(connection.id)}">
+          <div class="quick-row-main" role="button" tabindex="0" data-action="select-quick" data-id="${escapeHtml(connection.id)}">
             <span class="connection-icon ${connection.status}">
-              ${icon(connection.tunnel_type === "dynamic" ? "router" : "waypoints")}
+              ${icon(tunnelIconName(connection.tunnel_type))}
             </span>
-            <span>
+            <span class="quick-row-content">
               <strong>${escapeHtml(connection.name)}</strong>
-              <small>${escapeHtml(connectionSummary(connection))}</small>
+              <span class="quick-address-line">
+                <small class="quick-address">${escapeHtml(connectionSummary(connection))}</small>
+                ${renderCopyButton(connection, true)}
+              </span>
             </span>
-          </button>
+          </div>
           <div class="quick-row-actions">
             ${renderTunnelSwitch(connection)}
           </div>
@@ -1328,6 +1405,7 @@ async function handleAction(action: string, id: string | null, lang: string | nu
   if (action === "overview") showOverview();
   if (action === "settings") showSettings();
   if (action === "toggle-tunnel" && id) await toggleTunnel(id);
+  if (action === "copy-tunnel" && id) await copyTunnel(id);
   if (action === "delete" && id) await deleteConnection(id);
   if (action === "choose-key") await choosePrivateKey();
   if (action === "open-selected-config") await openSelectedQuickConfig();
@@ -1382,6 +1460,21 @@ function bindAppEvents() {
     const form = event.target;
     if (!(form instanceof HTMLFormElement) || form.id !== "connection-form") return;
     void saveConnection(event as SubmitEvent);
+  });
+
+  app.addEventListener("keydown", (event) => {
+    if (!(event instanceof KeyboardEvent)) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("button")) return;
+    const actionTarget = target?.closest<HTMLElement>('[role="button"][data-action]');
+    if (!actionTarget || !app.contains(actionTarget)) return;
+    event.preventDefault();
+    void handleAction(
+      actionTarget.dataset.action ?? "",
+      actionTarget.dataset.id ?? null,
+      actionTarget.dataset.lang ?? null,
+    );
   });
 }
 

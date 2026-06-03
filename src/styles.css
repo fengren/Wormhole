@@ -351,11 +351,64 @@ button:disabled {
 }
 
 .connection-summary {
+  min-width: 0;
   overflow: hidden;
+  flex: 0 1 auto;
   color: #72817d;
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.connection-summary-line {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 7px;
+}
+
+.connection-summary-line small {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.copy-tunnel-button {
+  display: inline-grid;
+  flex: 0 0 19px;
+  width: 19px;
+  min-width: 19px;
+  height: 19px;
+  place-items: center;
+  border-radius: 4px;
+  background: transparent;
+  color: #16705f;
+  padding: 0;
+}
+
+.copy-tunnel-button:hover {
+  background: #e7f6f1;
+  color: #084f43;
+}
+
+.copy-tunnel-button .icon {
+  width: 16px;
+  height: 16px;
+  stroke-width: 2.5;
+}
+
+.copy-tunnel-button.compact {
+  flex-basis: 18px;
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+}
+
+.copy-tunnel-button.compact .icon {
+  width: 15px;
+  height: 15px;
 }
 
 .tunnel-toggle {
@@ -1156,17 +1209,38 @@ select:focus {
   text-align: left;
 }
 
-.quick-row-main span:last-child {
+.quick-row-content {
   display: grid;
   min-width: 0;
   gap: 2px;
 }
 
+.quick-address-line {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
 .quick-row-main strong,
-.quick-row-main small {
+.quick-address {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.quick-address {
+  display: block;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.quick-address-line .copy-tunnel-button {
+  flex: 0 0 18px;
+  width: 18px;
+  min-width: 18px;
 }
 
 .quick-row-main strong {
@@ -1183,6 +1257,7 @@ select:focus {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 6px;
 }
 
 .quick-footer {

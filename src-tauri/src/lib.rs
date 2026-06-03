@@ -42,6 +42,7 @@ const QUICK_PANEL_EDGE_GAP: f64 = 8.0;
 const QUICK_PANEL_TRAY_X_OFFSET: f64 = 18.0;
 const QUICK_PANEL_TRAY_Y_OFFSET: f64 = 12.0;
 const MAX_ACTIVE_CONNECTIONS: usize = 128;
+const REMOTE_FORWARD_BIND_HOST: &str = "0.0.0.0";
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum TunnelStatus {
@@ -732,7 +733,7 @@ fn start_remote_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
         shutdown: ssh_shutdown,
     } = connect_ssh_session(config)?;
     let (mut listener, _) = session
-        .channel_forward_listen(config.local_port, None, Some(32))
+        .channel_forward_listen(config.local_port, Some(REMOTE_FORWARD_BIND_HOST), Some(32))
         .map_err(|err| err.to_string())?;
     session.set_blocking(false);
     let stop = Arc::new(AtomicBool::new(false));
@@ -1114,7 +1115,7 @@ fn proxy_channel(
                     let _ = channel.send_eof();
                 }
                 Ok(read) => {
-                    write_all_nonblocking(&mut channel, &client_buffer[..read], &stop)
+                    write_channel_nonblocking(&mut channel, &client_buffer[..read], &stop)
                         .map_err(|error| format!("write to SSH channel failed: {error}"))?;
                     bytes_total.fetch_add(read as u64, Ordering::Relaxed);
                     progressed = true;
@@ -1127,8 +1128,10 @@ fn proxy_channel(
         if !channel_closed {
             match channel.read(&mut channel_buffer) {
                 Ok(0) => {
-                    channel_closed = true;
-                    let _ = client.shutdown(Shutdown::Write);
+                    if channel.eof() {
+                        channel_closed = true;
+                        let _ = client.shutdown(Shutdown::Write);
+                    }
                 }
                 Ok(read) => {
                     write_all_nonblocking(&mut client, &channel_buffer[..read], &stop)
@@ -1149,6 +1152,46 @@ fn proxy_channel(
     let _ = channel.close();
     let _ = client.shutdown(Shutdown::Both);
     Ok(())
+}
+
+fn write_channel_nonblocking(
+    channel: &mut Channel,
+    mut data: &[u8],
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    while !data.is_empty() {
+        if stop.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "tunnel is stopping",
+            ));
+        }
+        match channel.write(data) {
+            Ok(0) if !channel.eof() => thread::sleep(Duration::from_millis(5)),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "ssh channel closed",
+                ))
+            }
+            Ok(written) => data = &data[written..],
+            Err(error) if is_would_block(&error) => thread::sleep(Duration::from_millis(5)),
+            Err(error) => return Err(error),
+        }
+    }
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "tunnel is stopping",
+            ));
+        }
+        match channel.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if is_would_block(&error) => thread::sleep(Duration::from_millis(5)),
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn write_all_nonblocking<W: Write>(
