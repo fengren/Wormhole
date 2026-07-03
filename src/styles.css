@@ -1305,3 +1305,591 @@ select:focus {
   border-color: #dc2626;
   background: #fff1ef;
 }
+
+/* Apple system theme */
+:root {
+  color-scheme: light dark;
+  --apple-bg: #f5f5f7;
+  --apple-bg-elevated: rgba(255, 255, 255, 0.78);
+  --apple-bg-solid: #ffffff;
+  --apple-sidebar: rgba(242, 242, 247, 0.82);
+  --apple-control: rgba(255, 255, 255, 0.72);
+  --apple-control-hover: rgba(255, 255, 255, 0.94);
+  --apple-fill: rgba(120, 120, 128, 0.12);
+  --apple-fill-strong: rgba(120, 120, 128, 0.2);
+  --apple-border: rgba(60, 60, 67, 0.16);
+  --apple-border-strong: rgba(60, 60, 67, 0.28);
+  --apple-text: #1d1d1f;
+  --apple-text-secondary: rgba(60, 60, 67, 0.72);
+  --apple-text-tertiary: rgba(60, 60, 67, 0.52);
+  --apple-accent: #007aff;
+  --apple-accent-hover: #006edb;
+  --apple-accent-soft: rgba(0, 122, 255, 0.12);
+  --apple-green: #34c759;
+  --apple-green-soft: rgba(52, 199, 89, 0.14);
+  --apple-orange: #ff9500;
+  --apple-orange-soft: rgba(255, 149, 0, 0.16);
+  --apple-red: #ff3b30;
+  --apple-red-soft: rgba(255, 59, 48, 0.12);
+  --apple-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --apple-shadow-raised:
+    0 18px 44px rgba(0, 0, 0, 0.14),
+    0 2px 8px rgba(0, 0, 0, 0.08);
+
+  color: var(--apple-text);
+  background: var(--apple-bg);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "Helvetica Neue", Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --apple-bg: #1c1c1e;
+    --apple-bg-elevated: rgba(44, 44, 46, 0.78);
+    --apple-bg-solid: #2c2c2e;
+    --apple-sidebar: rgba(28, 28, 30, 0.84);
+    --apple-control: rgba(58, 58, 60, 0.72);
+    --apple-control-hover: rgba(72, 72, 74, 0.92);
+    --apple-fill: rgba(120, 120, 128, 0.2);
+    --apple-fill-strong: rgba(120, 120, 128, 0.32);
+    --apple-border: rgba(235, 235, 245, 0.14);
+    --apple-border-strong: rgba(235, 235, 245, 0.28);
+    --apple-text: #f5f5f7;
+    --apple-text-secondary: rgba(235, 235, 245, 0.68);
+    --apple-text-tertiary: rgba(235, 235, 245, 0.46);
+    --apple-accent: #0a84ff;
+    --apple-accent-hover: #409cff;
+    --apple-accent-soft: rgba(10, 132, 255, 0.2);
+    --apple-green: #30d158;
+    --apple-green-soft: rgba(48, 209, 88, 0.2);
+    --apple-orange: #ff9f0a;
+    --apple-orange-soft: rgba(255, 159, 10, 0.2);
+    --apple-red: #ff453a;
+    --apple-red-soft: rgba(255, 69, 58, 0.2);
+    --apple-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+    --apple-shadow-raised:
+      0 18px 44px rgba(0, 0, 0, 0.38),
+      0 2px 8px rgba(0, 0, 0, 0.24);
+  }
+}
+
+body {
+  background:
+    radial-gradient(circle at 82% 0%, var(--apple-accent-soft), transparent 28rem),
+    var(--apple-bg);
+}
+
+.shell {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.24), transparent 18rem),
+    var(--apple-bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  .shell {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 18rem),
+      var(--apple-bg);
+  }
+}
+
+.sidebar,
+.quick-panel {
+  border-color: var(--apple-border);
+  background: var(--apple-sidebar);
+  -webkit-backdrop-filter: blur(22px) saturate(180%);
+  backdrop-filter: blur(22px) saturate(180%);
+}
+
+.sidebar {
+  box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.42);
+}
+
+@media (prefers-color-scheme: dark) {
+  .sidebar {
+    box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.04);
+  }
+}
+
+.quick-panel {
+  box-shadow: var(--apple-shadow-raised);
+}
+
+.brand-mark {
+  border-color: var(--apple-border);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.68), transparent),
+    var(--apple-accent-soft);
+  color: var(--apple-accent);
+  box-shadow: var(--apple-shadow);
+}
+
+.brand-mark::before {
+  border-color: rgba(0, 122, 255, 0.18);
+}
+
+.brand-mark::after {
+  border-color: rgba(52, 199, 89, 0.26);
+}
+
+.brand-button h1,
+.connection-name,
+.overview-heading h2,
+.editor-heading h2,
+.settings-heading h2,
+.settings-row h3,
+.metric strong,
+.monitor-heading h3,
+.monitor-heading strong,
+.policy-panel h3,
+.policy-panel summary,
+.tunnel-help strong,
+.quick-header h1,
+.quick-empty strong,
+.quick-row-main strong {
+  color: var(--apple-text);
+}
+
+.brand-button span,
+.connection-summary,
+.overview-heading p,
+.editor-heading p,
+.settings-heading p,
+.settings-row p,
+.metric > span,
+.metric small,
+.monitor-heading span,
+.monitor-heading small,
+.monitor-foot,
+label,
+.policy-panel p,
+.tunnel-help small,
+.quick-header p,
+.quick-empty,
+.quick-row-main small,
+.message {
+  color: var(--apple-text-secondary);
+}
+
+.language-toggle > span,
+.language-toggle button,
+.connection-icon,
+.status.stopped,
+.metric strong.stopped,
+select {
+  color: var(--apple-text-tertiary);
+}
+
+.new-button,
+.settings-button,
+.update-button,
+.connection-row,
+.settings-row,
+.metric,
+.monitor-card,
+.policy-panel,
+.input-with-action button,
+.segmented,
+.tunnel-help,
+.quick-empty,
+.quick-row,
+.quick-config-button,
+input,
+select {
+  border-color: var(--apple-border);
+  background: var(--apple-bg-elevated);
+  box-shadow: var(--apple-shadow);
+}
+
+.language-toggle,
+.version-value {
+  border-color: var(--apple-border);
+  background: var(--apple-fill);
+  color: var(--apple-text);
+}
+
+.new-button,
+.settings-button.active,
+.update-button:hover:not(:disabled),
+.copy-tunnel-button,
+.input-with-action button,
+.quick-config-button,
+.overview-heading h2 .icon,
+.settings-row h3 .icon,
+.metric > span .icon,
+.monitor-heading h3 .icon,
+.quick-header h1 .icon {
+  color: var(--apple-accent);
+}
+
+.settings-button,
+.update-button,
+.secondary {
+  color: var(--apple-text);
+}
+
+.new-button:hover,
+.settings-button:hover,
+.settings-button.active,
+.update-button:hover:not(:disabled),
+.connection-row:hover,
+.connection-row.selected,
+.input-with-action button:hover,
+.tunnel-help:hover,
+.tunnel-help.active,
+.quick-row.selected,
+.quick-config-button:hover {
+  border-color: var(--apple-border-strong);
+  background: var(--apple-control-hover);
+}
+
+.connection-row.selected,
+.tunnel-help.active,
+.quick-row.selected {
+  box-shadow:
+    inset 0 0 0 1px var(--apple-accent-soft),
+    var(--apple-shadow);
+}
+
+.connection-icon {
+  border-color: var(--apple-border);
+  background: var(--apple-fill);
+}
+
+.connection-icon.running,
+.status.running,
+.metric strong.running {
+  color: var(--apple-green);
+}
+
+.connection-icon.running,
+.status.running,
+.quick-row.running {
+  border-color: rgba(52, 199, 89, 0.34);
+  background: var(--apple-green-soft);
+}
+
+.connection-icon.exited,
+.status.exited,
+.metric strong.exited {
+  color: var(--apple-orange);
+}
+
+.connection-icon.exited,
+.status.exited {
+  border-color: rgba(255, 149, 0, 0.34);
+  background: var(--apple-orange-soft);
+}
+
+.connection-icon.needs_auth,
+.status.needs_auth,
+.message[data-kind="error"],
+.danger,
+.actions button.danger,
+.quick-quit-button {
+  color: var(--apple-red);
+}
+
+.connection-icon.needs_auth,
+.status.needs_auth,
+.message-action,
+.quick-quit-button {
+  border-color: rgba(255, 59, 48, 0.34);
+  background: var(--apple-red-soft);
+}
+
+.copy-tunnel-button:hover {
+  background: var(--apple-accent-soft);
+  color: var(--apple-accent-hover);
+}
+
+.toggle-track {
+  border-color: var(--apple-border);
+  background: var(--apple-fill-strong);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.tunnel-toggle.is-on .toggle-track {
+  border-color: transparent;
+  background: var(--apple-green);
+}
+
+.tunnel-toggle.exited .toggle-track {
+  border-color: transparent;
+  background: var(--apple-orange);
+}
+
+.tunnel-toggle.needs_auth .toggle-track {
+  border-color: transparent;
+  background: var(--apple-red);
+}
+
+.toggle-thumb {
+  background: #ffffff;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.18),
+    0 2px 6px rgba(0, 0, 0, 0.16);
+}
+
+.status {
+  border: 1px solid transparent;
+}
+
+.empty {
+  border-color: var(--apple-border-strong);
+  color: var(--apple-text-secondary);
+  background: var(--apple-fill);
+}
+
+.message-action {
+  color: var(--apple-red);
+}
+
+.message-action:hover,
+.quick-quit-button:hover {
+  border-color: var(--apple-red);
+  background: var(--apple-red-soft);
+}
+
+input,
+select {
+  color: var(--apple-text);
+}
+
+select {
+  background:
+    linear-gradient(45deg, transparent 50%, var(--apple-text-tertiary) 50%) right 14px center / 6px 6px no-repeat,
+    linear-gradient(135deg, var(--apple-text-tertiary) 50%, transparent 50%) right 10px center / 6px 6px no-repeat,
+    var(--apple-bg-elevated);
+}
+
+input:focus,
+select:focus {
+  border-color: var(--apple-accent);
+  box-shadow: 0 0 0 3px var(--apple-accent-soft);
+}
+
+.policy-panel summary::after {
+  border-color: var(--apple-border);
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")
+      center / 16px 16px no-repeat,
+    var(--apple-fill);
+}
+
+.policy-panel[open] summary::after {
+  border-color: var(--apple-border-strong);
+  background-color: var(--apple-accent-soft);
+}
+
+.segmented {
+  background: var(--apple-fill);
+}
+
+.segmented label {
+  border-color: var(--apple-border);
+  color: var(--apple-text-secondary);
+}
+
+.segmented label.active,
+.language-toggle button.active,
+.actions button,
+.new-button {
+  background: var(--apple-accent);
+  color: #ffffff;
+}
+
+.segmented label.active {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.language-toggle button:hover:not(.active) {
+  background: var(--apple-fill-strong);
+}
+
+.actions button:hover,
+.new-button:hover {
+  border-color: transparent;
+  background: var(--apple-accent-hover);
+  color: #ffffff;
+}
+
+.secondary {
+  border-color: var(--apple-border);
+  background: var(--apple-bg-elevated);
+}
+
+.secondary:hover {
+  background: var(--apple-control-hover);
+}
+
+.actions button.danger,
+.danger {
+  border-color: transparent;
+  background: var(--apple-red);
+  color: #ffffff;
+}
+
+.actions button.danger:hover,
+.danger:hover {
+  border-color: transparent;
+  background: #d70015;
+}
+
+.actions button.danger:focus-visible,
+.danger:focus-visible {
+  outline-color: var(--apple-red-soft);
+}
+
+.monitor-chart line {
+  stroke: var(--apple-border);
+}
+
+.monitor-chart polygon {
+  fill: var(--apple-accent-soft);
+}
+
+.monitor-chart polyline {
+  stroke: var(--apple-accent);
+}
+
+.tunnel-help span {
+  color: var(--apple-text);
+}
+
+.quick-config-button {
+  color: var(--apple-accent);
+}
+
+/* Compact menubar panel */
+.quick-panel {
+  gap: 8px;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.quick-header h1 {
+  gap: 7px;
+  font-size: 15px;
+  line-height: 1.15;
+}
+
+.quick-header h1 .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.quick-header p {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.quick-list {
+  gap: 5px;
+}
+
+.quick-empty {
+  gap: 3px;
+  border-radius: 7px;
+  padding: 12px;
+}
+
+.quick-empty strong {
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.quick-empty span {
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.quick-row {
+  min-height: 56px;
+  gap: 8px;
+  border-radius: 7px;
+  padding: 7px 8px;
+}
+
+.quick-row-main {
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 8px;
+  min-height: 38px;
+  padding: 0;
+}
+
+.quick-panel .connection-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+}
+
+.quick-panel .connection-icon .icon {
+  width: 15px;
+  height: 15px;
+}
+
+.quick-row-content {
+  gap: 1px;
+}
+
+.quick-address-line {
+  gap: 4px;
+}
+
+.quick-row-main strong {
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.quick-row-main small {
+  font-size: 10.5px;
+  line-height: 1.25;
+}
+
+.quick-row-actions {
+  gap: 4px;
+}
+
+.quick-panel .tunnel-toggle {
+  width: 42px;
+  min-width: 42px;
+  height: 24px;
+}
+
+.quick-panel .toggle-track {
+  width: 38px;
+  height: 22px;
+}
+
+.quick-panel .toggle-thumb {
+  width: 16px;
+  height: 16px;
+}
+
+.quick-panel .tunnel-toggle.is-on .toggle-thumb {
+  transform: translateX(16px);
+}
+
+.quick-footer {
+  gap: 6px;
+  padding-top: 0;
+}
+
+.quick-config-button,
+.quick-quit-button {
+  min-height: 34px;
+  gap: 6px;
+  border-radius: 7px;
+  font-size: 12px;
+  line-height: 1.2;
+  padding: 7px 10px;
+}
+
+.quick-config-button .icon,
+.quick-quit-button .icon {
+  width: 15px;
+  height: 15px;
+}
