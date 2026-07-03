@@ -122,6 +122,7 @@ let serviceStatus: ServiceStatus = {
 let message = "";
 let messageKind: "info" | "error" = "info";
 let messageAction: MessageAction | null = null;
+let messageTimer: ReturnType<typeof window.setTimeout> | null = null;
 let monitorSamples: MonitorSample[] = [];
 let updateState: UpdateState = "idle";
 let updateProgress = 0;
@@ -542,6 +543,10 @@ function showMessage(
   kind: "info" | "error" = "info",
   action: MessageAction | null = null,
 ) {
+  if (messageTimer) {
+    window.clearTimeout(messageTimer);
+    messageTimer = null;
+  }
   message = nextMessage;
   messageKind = kind;
   messageAction = action;
@@ -550,6 +555,14 @@ function showMessage(
     target.innerHTML = renderMessageContent();
     target.dataset.kind = kind;
     hydrateIcons(target);
+  }
+  if (nextMessage && !action) {
+    messageTimer = window.setTimeout(
+      () => {
+        showMessage("");
+      },
+      kind === "error" ? 9000 : 3000,
+    );
   }
 }
 
@@ -1248,6 +1261,8 @@ function renderForm() {
   const authProfile = field("auth_profile");
   const isDynamic = tunnelType === "dynamic";
   const canAutoReconnect = authProfile === "normal";
+  const technicalInputAttrs =
+    'spellcheck="false" autocapitalize="none" autocorrect="off"';
   const selected = selectedId
     ? connections.find((connection) => connection.id === selectedId)
     : null;
@@ -1268,7 +1283,7 @@ function renderForm() {
         </label>
         <label>
           ${escapeHtml(t("form.sshHost"))}
-          <input name="host" value="${escapeHtml(field("host"))}" placeholder="example.com" required />
+          <input name="host" value="${escapeHtml(field("host"))}" placeholder="example.com" ${technicalInputAttrs} required />
         </label>
         <label>
           ${escapeHtml(t("form.sshPort"))}
@@ -1276,7 +1291,7 @@ function renderForm() {
         </label>
         <label>
           ${escapeHtml(t("form.username"))}
-          <input name="username" value="${escapeHtml(field("username"))}" autocomplete="username" required />
+          <input name="username" value="${escapeHtml(field("username"))}" autocomplete="username" ${technicalInputAttrs} required />
         </label>
       </div>
 
@@ -1295,7 +1310,7 @@ function renderForm() {
         <label class="${authMethod === "password" ? "hidden" : ""}">
           ${escapeHtml(t("form.privateKeyPath"))}
           <span class="input-with-action">
-            <input name="key_path" value="${escapeHtml(field("key_path"))}" placeholder="~/.ssh/id_ed25519" />
+            <input name="key_path" value="${escapeHtml(field("key_path"))}" placeholder="~/.ssh/id_ed25519" ${technicalInputAttrs} />
             <button type="button" data-action="choose-key">${escapeHtml(t("form.choose"))}</button>
           </span>
         </label>
@@ -1318,7 +1333,7 @@ function renderForm() {
         </label>
         <label class="${isDynamic ? "hidden" : ""}">
           ${escapeHtml(t("form.targetHost"))}
-          <input name="remote_host" value="${escapeHtml(field("remote_host"))}" />
+          <input name="remote_host" value="${escapeHtml(field("remote_host"))}" ${technicalInputAttrs} />
         </label>
         <label class="${isDynamic ? "hidden" : ""}">
           ${escapeHtml(t("form.targetPort"))}

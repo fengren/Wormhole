@@ -732,9 +732,32 @@ fn start_remote_tunnel(config: &SshConfig) -> Result<TunnelHandle, String> {
         session,
         shutdown: ssh_shutdown,
     } = connect_ssh_session(config)?;
-    let (mut listener, _) = session
-        .channel_forward_listen(config.local_port, Some(REMOTE_FORWARD_BIND_HOST), Some(32))
-        .map_err(|err| err.to_string())?;
+    let (mut listener, _) = match session.channel_forward_listen(
+        config.local_port,
+        Some(REMOTE_FORWARD_BIND_HOST),
+        Some(32),
+    ) {
+        Ok(listener) => listener,
+        Err(public_bind_error) => {
+            log::warn!(
+                "Remote tunnel public bind {}:{} failed: {}. Falling back to SSH server default bind. Configure GatewayPorts clientspecified on the SSH server to expose the port publicly.",
+                REMOTE_FORWARD_BIND_HOST,
+                config.local_port,
+                public_bind_error
+            );
+            session
+                .channel_forward_listen(config.local_port, None, Some(32))
+                .map_err(|default_bind_error| {
+                    format!(
+                        "Could not listen on remote port {}. The remote port may already be in use; choose another remote listen port and try again. Public bind {} failed: {}; default bind failed: {}. If the port is free, check AllowTcpForwarding and GatewayPorts on the SSH server.",
+                        config.local_port,
+                        REMOTE_FORWARD_BIND_HOST,
+                        public_bind_error,
+                        default_bind_error
+                    )
+                })?
+        }
+    };
     session.set_blocking(false);
     let stop = Arc::new(AtomicBool::new(false));
     let bytes_total = Arc::new(AtomicU64::new(0));
